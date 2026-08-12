@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Federal Signal · 美国政府新闻聚合器</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <div><span class="eyebrow">FEDERAL SIGNAL</span><h1>美国政府新闻雷达</h1><p>官方来源 · 最近 5 天 · 中文工作台</p></div>
+    <div class="actions"><button id="refresh">刷新并翻译</button><button id="translate" class="ghost">翻译待翻译</button><button id="notion" class="ghost">同步 Notion</button><a class="button ghost" href="/api/notion.csv">导出 CSV</a></div>
+  </header>
+  <main>
+    <section class="stats" id="stats"></section>
+    <section class="toolbar">
+      <input id="search" placeholder="搜索标题、中文摘要…">
+      <select id="group"><option value="">全部机构分组</option></select>
+      <select id="state"><option value="">全部状态</option><option>已翻译</option><option>待翻译</option></select>
+      <div class="view-toggle"><button data-view="cards" class="active">卡片</button><button data-view="table">表格</button></div>
+    </section>
+    <section class="content">
+      <aside><button class="side-title" id="all-sources" type="button">全部来源</button><div id="sources"></div></aside>
+      <div><div id="notice"></div><div id="news" class="cards"></div></div>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

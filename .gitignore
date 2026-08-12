@@ -1,0 +1,9 @@
+.env
+config.local.env
+*.log
+__pycache__/
+*.py[cod]
+vendor/
+.chrome-headless-test*/
+data/*
+data/notion-sync.lock

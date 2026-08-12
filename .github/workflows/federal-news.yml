@@ -1,0 +1,60 @@
+name: Federal News Scheduled Sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Asia/Taipei 12:20, 00:20, 06:20 (GitHub cron uses UTC).
+    - cron: "20 4 * * *"
+    - cron: "20 16 * * *"
+    - cron: "20 22 * * *"
+
+concurrency:
+  group: federal-news-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scrape-translate-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PYTHONUTF8: "1"
+      NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+      NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+      NOTION_DATA_SOURCE_ID: ${{ secrets.NOTION_DATA_SOURCE_ID }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Validate Notion secrets
+        shell: bash
+        run: |
+          test -n "$NOTION_API_KEY" || { echo "Missing NOTION_API_KEY"; exit 1; }
+          test -n "$NOTION_DATABASE_ID" || { echo "Missing NOTION_DATABASE_ID"; exit 1; }
+
+      - name: Scrape and translate latest five days
+        run: python scraper.py --translate
+
+      - name: Sync new records to Notion
+        run: python notion_sync.py
+
+      - name: Upload run data and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: federal-news-${{ github.run_id }}
+          path: data/*.json
+          if-no-files-found: warn
+          retention-days: 14

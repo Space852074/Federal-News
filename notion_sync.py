@@ -1,0 +1,207 @@
+from __future__ import annotations
+
+import json
+import os
+import ssl
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+ROOT = Path(__file__).resolve().parent
+DATA = ROOT / "data"
+API = "https://api.notion.com/v1"
+NOTION_VERSION = "2026-03-11"
+DEFAULT_DATABASE_ID = "3a393e41daef80ea84bcfc4d06501ec3"
+CA_FILE = ROOT / "vendor" / "certifi" / "cacert.pem"
+
+
+def compact_id(value: str) -> str:
+    return value.replace("-", "").strip()
+
+
+def request(token: str, method: str, path: str, payload=None):
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    req = Request(
+        API + path,
+        data=body,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Notion-Version": NOTION_VERSION,
+            "Content-Type": "application/json",
+            "User-Agent": "FederalSignal/1.0",
+        },
+    )
+    context = ssl.create_default_context(cafile=str(CA_FILE)) if CA_FILE.exists() else ssl.create_default_context()
+    last_error = None
+    for attempt in range(3):
+        try:
+            with urlopen(req, timeout=45, context=context) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Notion API {exc.code}: {detail}") from exc
+        except (URLError, TimeoutError, ssl.SSLError) as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"无法连接 Notion API：{last_error}") from last_error
+
+
+def find_property(schema: dict, expected: str, wanted_type: str | None = None):
+    for name, config in schema.items():
+        if name.casefold() == expected.casefold() and (not wanted_type or config.get("type") == wanted_type):
+            return name, config
+    return None, None
+
+
+def title_property(schema: dict):
+    for name, config in schema.items():
+        if config.get("type") == "title":
+            return name, config
+    raise RuntimeError("目标数据源没有 title 类型字段")
+
+
+def text_value(value: str):
+    return {"rich_text": [{"type": "text", "text": {"content": value[:2000]}}]}
+
+
+def title_value(value: str):
+    return {"title": [{"type": "text", "text": {"content": value[:2000]}}]}
+
+
+def existing_keys(token: str, data_source_id: str, key_name: str):
+    keys, cursor = set(), None
+    while True:
+        payload = {"page_size": 100}
+        if cursor:
+            payload["start_cursor"] = cursor
+        result = request(token, "POST", f"/data_sources/{data_source_id}/query", payload)
+        for page in result.get("results", []):
+            prop = page.get("properties", {}).get(key_name, {})
+            parts = prop.get("rich_text", []) if prop.get("type") == "rich_text" else []
+            value = "".join(x.get("plain_text", "") for x in parts)
+            if value:
+                keys.add(value)
+        if not result.get("has_more"):
+            return keys
+        cursor = result.get("next_cursor")
+
+
+def state_value(config: dict, desired: str):
+    kind = config.get("type")
+    options = config.get(kind, {}).get("options", []) if kind in {"status", "select"} else []
+    names = [x.get("name") for x in options]
+    if desired in names:
+        return {kind: {"name": desired}}
+    if kind == "select":
+        return {"select": {"name": desired}}
+    if kind == "status" and names:
+        return {"status": {"name": names[0]}}
+    return None
+
+
+def build_properties(row: dict, schema: dict):
+    title_name, _ = title_property(schema)
+    props = {title_name: title_value(row.get("title_zh") or row.get("title") or "无标题")}
+
+    date_name, _ = find_property(schema, "SortDate", "date")
+    if date_name and row.get("date"):
+        props[date_name] = {"date": {"start": row["date"]}}
+
+    txt_name, _ = find_property(schema, "txt", "rich_text")
+    if txt_name:
+        value = row.get("summary_zh") or row.get("summary") or row.get("title_zh") or row.get("title", "")
+        props[txt_name] = text_value(value)
+
+    link_name, _ = find_property(schema, "link", "url")
+    if link_name:
+        props[link_name] = {"url": row.get("url") or None}
+
+    key_name, _ = find_property(schema, "UniqueKey", "rich_text")
+    if key_name:
+        props[key_name] = text_value(row["unique_key"])
+
+    state_name, state_config = find_property(schema, "State")
+    if state_name and state_config:
+        value = state_value(state_config, row.get("state", "已翻译"))
+        if value:
+            props[state_name] = value
+    return props
+
+
+def main():
+    DATA.mkdir(exist_ok=True)
+    lock = DATA / "notion-sync.lock"
+    meta_path = DATA / "notion-sync.json"
+    if lock.exists():
+        print("Notion 同步正在运行")
+        return 2
+    lock.write_text(str(os.getpid()), encoding="ascii")
+    meta = {"status": "running", "started_at": datetime.now(timezone.utc).isoformat()}
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        token = os.environ.get("NOTION_API_KEY") or os.environ.get("NOTION_TOKEN")
+        if not token:
+            raise RuntimeError("未设置 NOTION_API_KEY 环境变量")
+        token = token.strip().strip('"').strip("'")
+        database_id = compact_id(os.environ.get("NOTION_DATABASE_ID", DEFAULT_DATABASE_ID))
+        database = request(token, "GET", f"/databases/{database_id}")
+        sources = database.get("data_sources", [])
+        if not sources:
+            raise RuntimeError("数据库中没有可用的数据源")
+        preferred = os.environ.get("NOTION_DATA_SOURCE_ID")
+        selected = next((x for x in sources if compact_id(x.get("id", "")) == compact_id(preferred or "")), sources[0])
+        data_source_id = selected["id"]
+        data_source = request(token, "GET", f"/data_sources/{data_source_id}")
+        schema = data_source.get("properties", {})
+        key_name, _ = find_property(schema, "UniqueKey", "rich_text")
+        if not key_name:
+            raise RuntimeError("目标数据库缺少 rich_text 类型的 UniqueKey 字段")
+        known = existing_keys(token, data_source_id, key_name)
+        rows = json.loads((DATA / "news.json").read_text(encoding="utf-8"))
+        pending = [row for row in rows if row.get("unique_key") not in known]
+        created, errors = 0, []
+        for row in pending:
+            payload = {
+                "parent": {"type": "data_source_id", "data_source_id": data_source_id},
+                "properties": build_properties(row, schema),
+                "children": [
+                    {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": f"机构：{row.get('agency', '')}"}}]}},
+                    {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": row.get("title", "")}}]}},
+                ],
+            }
+            try:
+                request(token, "POST", "/pages", payload)
+                created += 1
+            except RuntimeError as exc:
+                errors.append({"unique_key": row.get("unique_key"), "title": row.get("title"), "error": str(exc)})
+            time.sleep(0.38)
+        meta = {
+            "status": "complete" if not errors else "partial",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "database_id": database_id,
+            "data_source_id": data_source_id,
+            "total_local": len(rows),
+            "existing": len(known),
+            "created": created,
+            "skipped": len(rows) - len(pending),
+            "errors": errors,
+        }
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(json.dumps(meta, ensure_ascii=False, indent=2))
+        return 0 if not errors else 1
+    except Exception as exc:
+        meta.update({"status": "error", "finished_at": datetime.now(timezone.utc).isoformat(), "error": str(exc)})
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(meta["error"], file=sys.stderr)
+        return 1
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
