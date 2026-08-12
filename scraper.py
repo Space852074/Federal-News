@@ -43,6 +43,19 @@ NON_NEWS_TITLES = {
     "office of the spokesperson",
     "state department home state department home state department home",
 }
+RED_KEYWORDS = re.compile(r"\b(?:china|chinese)\b", re.I)
+YELLOW_KEYWORDS = re.compile(r"\b(?:virus|covid-?19|vaccine|fentanyl)\b", re.I)
+
+
+def apply_keyword_markers(row):
+    """Prefix the display title when the English title or article body matches monitored terms."""
+    haystack = "\n".join((row.get("title", ""), row.get("content", "")))
+    markers = ("🔴" if RED_KEYWORDS.search(haystack) else "") + ("🟡" if YELLOW_KEYWORDS.search(haystack) else "")
+    title = (row.get("title_zh") or row.get("title") or "").lstrip("🔴🟡")
+    if title:
+        row["title_zh"] = markers + title
+    row["keyword_markers"] = markers
+    return row
 
 
 def build_session(retries=2):
@@ -99,6 +112,46 @@ class LinkParser(HTMLParser):
         if item["href"] and tag == "a":
             self.links.append((item["href"], " ".join(item["text"])))
         if tag in {"script", "style", "svg", "nav", "footer"} and self.skip:
+            self.skip -= 1
+
+
+class ArticleTextParser(HTMLParser):
+    """Extract readable paragraphs from a news detail page without navigation chrome."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.depth = 0
+        self.skip = 0
+        self.capture = 0
+        self.current = []
+        self.paragraphs = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        marker = " ".join((attrs.get("class", ""), attrs.get("id", ""))).lower()
+        if tag in {"script", "style", "svg", "nav", "footer", "header", "form", "aside"}:
+            self.skip += 1
+        if not self.skip and (tag in {"article", "main"} or any(x in marker for x in ("article-body", "field--name-body", "entry-content", "node__content", "content-body", "press-release"))):
+            self.capture += 1
+        if not self.skip and self.capture and tag in {"p", "li", "h2", "h3", "blockquote"}:
+            self.depth += 1
+            self.current = []
+
+    def handle_data(self, data):
+        if self.depth and not self.skip:
+            text = " ".join(data.split())
+            if text:
+                self.current.append(text)
+
+    def handle_endtag(self, tag):
+        if tag in {"p", "li", "h2", "h3", "blockquote"} and self.depth:
+            text = clean_title(" ".join(self.current))
+            if len(text) >= 25:
+                self.paragraphs.append(text)
+            self.depth -= 1
+            self.current = []
+        if tag in {"article", "main"} and self.capture:
+            self.capture -= 1
+        if tag in {"script", "style", "svg", "nav", "footer", "header", "form", "aside"} and self.skip:
             self.skip -= 1
 
 
@@ -179,7 +232,7 @@ def make_row(source, published, title, link, summary=""):
     return {
         "source_id": source["id"], "agency": source["agency"], "group": source["group"],
         "date": published.isoformat(), "title": clean_title(title), "title_zh": "",
-        "summary": clean_title(summary)[:1000], "summary_zh": "", "url": link,
+        "summary": clean_title(summary)[:1000], "summary_zh": "", "content": "", "content_zh": "", "url": link,
         "unique_key": key, "state": "待翻译", "created_time": datetime.now(timezone.utc).isoformat()
     }
 
@@ -459,11 +512,120 @@ def translate_google(rows):
     return rows
 
 
+def extract_article_content(row):
+    url = row.get("url", "")
+    if not url or "search_api_fulltext=" in url or "combine=" in url:
+        return row["unique_key"], ""
+    try:
+        _, _, body = fetch(url, timeout=30, session=QUICK_SESSION, outer_attempts=1)
+        parser = ArticleTextParser(); parser.feed(body)
+        seen, paragraphs = set(), []
+        for paragraph in parser.paragraphs:
+            normalized = paragraph.casefold()
+            if normalized in seen or paragraph == row.get("title"):
+                continue
+            if any(x in normalized for x in ("subscribe", "privacy policy", "accessibility", "all rights reserved", "share this page")):
+                continue
+            seen.add(normalized); paragraphs.append(paragraph)
+        return row["unique_key"], "\n\n".join(paragraphs)[:8000]
+    except Exception:
+        return row["unique_key"], ""
+
+
+def enrich_contents(rows, old_rows):
+    cached = {r.get("unique_key"): (r.get("content", ""), r.get("content_zh", "")) for r in old_rows}
+    by_key = {r["unique_key"]: r for r in rows}
+    pending = []
+    for row in rows:
+        content, content_zh = cached.get(row["unique_key"], ("", ""))
+        row["content"], row["content_zh"] = content, content_zh
+        if not content:
+            pending.append(row)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for key, content in pool.map(extract_article_content, pending):
+            if content:
+                by_key[key]["content"] = content
+    return rows
+
+
+def translate_contents(rows):
+    jobs = []
+    for row in rows:
+        if row.get("content") and not row.get("content_zh"):
+            chunks, current = [], ""
+            for paragraph in row["content"].split("\n\n"):
+                if current and len(current) + len(paragraph) + 2 > 1800:
+                    chunks.append(current); current = paragraph
+                else:
+                    current = (current + "\n\n" + paragraph).strip()
+            if current:
+                chunks.append(current)
+            for index, chunk in enumerate(chunks):
+                jobs.append((row["unique_key"], index, chunk))
+
+    def translate_job(job):
+        key, index, chunk = job
+        try:
+            response = QUICK_SESSION.get(
+                "https://translate.googleapis.com/translate_a/single",
+                params={"client": "gtx", "sl": "auto", "tl": "zh-CN", "dt": "t", "q": chunk}, timeout=35,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            translated = "".join(part[0] for part in payload[0] if part and part[0]).strip()
+            return key, index, translated
+        except Exception:
+            return key, index, ""
+
+    translations = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for key, index, translated in pool.map(translate_job, jobs):
+            if translated:
+                translations.setdefault(key, {})[index] = translated
+    for row in rows:
+        pieces = translations.get(row["unique_key"], {})
+        if pieces:
+            row["content_zh"] = "\n\n".join(pieces[i] for i in sorted(pieces))[:10000]
+    return rows
+
+
+def load_key_file(path):
+    if not path:
+        return set()
+    payload = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    if isinstance(payload, dict):
+        payload = payload.get("keys", [])
+    return {str(value) for value in payload}
+
+
+def process_new_content(key_file):
+    """Fetch and translate bodies only for pages created by this run's metadata sync."""
+    rows = json.loads((DATA / "news.json").read_text(encoding="utf-8"))
+    target_keys = load_key_file(key_file)
+    targets = [row for row in rows if row.get("unique_key") in target_keys]
+    targets = enrich_contents(targets, [])
+    targets = translate_contents(targets)
+    for row in targets:
+        apply_keyword_markers(row)
+    (DATA / "news.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    result = {
+        "requested": len(target_keys),
+        "processed": len(targets),
+        "content_extracted": sum(bool(row.get("content")) for row in targets),
+        "content_translated": sum(bool(row.get("content_zh")) for row in targets),
+    }
+    (DATA / "content-stage.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument("--translate", action="store_true"); ap.add_argument("--translate-only", action="store_true"); ap.add_argument("--retry-errors", action="store_true"); args = ap.parse_args()
+    ap = argparse.ArgumentParser(); ap.add_argument("--translate", action="store_true"); ap.add_argument("--translate-only", action="store_true"); ap.add_argument("--retry-errors", action="store_true"); ap.add_argument("--content-keys"); args = ap.parse_args()
     DATA.mkdir(exist_ok=True)
     lock = DATA / "refresh.lock"; lock.write_text(str(os.getpid()), encoding="ascii")
     try:
+        if args.content_keys:
+            process_new_content(args.content_keys)
+            return
         previous_meta = json.loads((DATA / "meta.json").read_text(encoding="utf-8")) if (DATA / "meta.json").exists() else {}
         running_meta = {**previous_meta, "status": "running", "phase": "scraping", "started_at": datetime.now(timezone.utc).isoformat()}
         (DATA / "meta.json").write_text(json.dumps(running_meta, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -535,6 +697,7 @@ def main():
             (DATA / "meta.json").write_text(json.dumps(progress_meta, ensure_ascii=False, indent=2), encoding="utf-8")
             rows = translate_google(rows)
         for row in rows:
+            apply_keyword_markers(row)
             row["state"] = "已翻译" if row.get("title_zh") else "待翻译"
         # 将成功翻译写入标题缓存，后续刷新无需重复请求翻译服务。
         for row in rows:
@@ -543,7 +706,7 @@ def main():
         (DATA / "translations.json").write_text(json.dumps(title_translations, ensure_ascii=False, indent=2), encoding="utf-8")
         (DATA / "news.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
         (DATA / "source_status.json").write_text(json.dumps(sorted(statuses, key=lambda x:x["agency"]), ensure_ascii=False, indent=2), encoding="utf-8")
-        meta = {"status":"complete", "refreshed_at":datetime.now(timezone.utc).isoformat(), "cutoff":cutoff.isoformat(), "items":len(rows), "sources":len(enabled), "ok":sum(s["health"]=="ok" for s in statuses), "empty":sum(s["health"]=="empty" for s in statuses), "error":sum(s["health"]=="error" for s in statuses), "translated":sum(bool(r.get("title_zh")) for r in rows), "pending_translation":sum(not r.get("title_zh") for r in rows)}
+        meta = {"status":"complete", "refreshed_at":datetime.now(timezone.utc).isoformat(), "cutoff":cutoff.isoformat(), "items":len(rows), "sources":len(enabled), "ok":sum(s["health"]=="ok" for s in statuses), "empty":sum(s["health"]=="empty" for s in statuses), "error":sum(s["health"]=="error" for s in statuses), "translated":sum(bool(r.get("title_zh")) for r in rows), "pending_translation":sum(not r.get("title_zh") for r in rows), "content_extracted":sum(bool(r.get("content")) for r in rows), "content_translated":sum(bool(r.get("content_zh")) for r in rows)}
         (DATA / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as exc:
         failed_meta = {"status": "error", "refreshed_at": datetime.now(timezone.utc).isoformat(), "error_message": str(exc)}

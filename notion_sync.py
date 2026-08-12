@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import ssl
@@ -65,16 +66,27 @@ def title_property(schema: dict):
     raise RuntimeError("目标数据源没有 title 类型字段")
 
 
-def text_value(value: str):
-    return {"rich_text": [{"type": "text", "text": {"content": value[:2000]}}]}
+def text_value(value: str, max_chars=10000):
+    value = (value or "")[:max_chars]
+    return {"rich_text": [{"type": "text", "text": {"content": value[i:i+1900]}} for i in range(0, len(value), 1900)]}
 
 
 def title_value(value: str):
     return {"title": [{"type": "text", "text": {"content": value[:2000]}}]}
 
 
-def existing_keys(token: str, data_source_id: str, key_name: str):
-    keys, cursor = set(), None
+def load_keys(path: str):
+    key_path = Path(path)
+    if not key_path.exists():
+        return set()
+    payload = json.loads(key_path.read_text(encoding="utf-8-sig"))
+    if isinstance(payload, dict):
+        payload = payload.get("keys", [])
+    return {str(value) for value in payload}
+
+
+def existing_records(token: str, data_source_id: str, key_name: str, content_name: str | None):
+    records, cursor = {}, None
     while True:
         payload = {"page_size": 100}
         if cursor:
@@ -85,9 +97,11 @@ def existing_keys(token: str, data_source_id: str, key_name: str):
             parts = prop.get("rich_text", []) if prop.get("type") == "rich_text" else []
             value = "".join(x.get("plain_text", "") for x in parts)
             if value:
-                keys.add(value)
+                content = page.get("properties", {}).get(content_name, {}) if content_name else {}
+                content_parts = content.get("rich_text", []) if content.get("type") == "rich_text" else []
+                records[value] = {"page_id": page.get("id"), "has_content": bool("".join(x.get("plain_text", "") for x in content_parts).strip())}
         if not result.get("has_more"):
-            return keys
+            return records
         cursor = result.get("next_cursor")
 
 
@@ -104,7 +118,7 @@ def state_value(config: dict, desired: str):
     return None
 
 
-def build_properties(row: dict, schema: dict):
+def build_properties(row: dict, schema: dict, include_content=True):
     title_name, _ = title_property(schema)
     # 该数据库以“部门”为标题列，新闻标题存放在 rich_text“标题”列。
     title_text_name, _ = find_property(schema, "标题", "rich_text")
@@ -136,10 +150,17 @@ def build_properties(row: dict, schema: dict):
         value = state_value(state_config, row.get("state", "已翻译"))
         if value:
             props[state_name] = value
+    content_name, _ = find_property(schema, "内容", "rich_text")
+    if include_content and content_name and (row.get("content_zh") or row.get("content")):
+        props[content_name] = text_value(row.get("content_zh") or row.get("content"), 10000)
     return props
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stage", choices=("metadata", "content"), default="metadata")
+    parser.add_argument("--keys", default=str(DATA / "notion-new-keys.json"))
+    args = parser.parse_args()
     DATA.mkdir(exist_ok=True)
     lock = DATA / "notion-sync.lock"
     meta_path = DATA / "notion-sync.json"
@@ -172,14 +193,18 @@ def main():
             key_name, _ = find_property(schema, "UniqueKey", "rich_text")
         if not key_name:
             raise RuntimeError("无法在目标数据库创建 UniqueKey 去重字段")
-        known = existing_keys(token, data_source_id, key_name)
+        content_name, _ = find_property(schema, "内容", "rich_text")
+        known = existing_records(token, data_source_id, key_name, content_name)
         rows = json.loads((DATA / "news.json").read_text(encoding="utf-8"))
-        pending = [row for row in rows if row.get("unique_key") not in known]
-        created, errors = 0, []
+        requested_keys = load_keys(args.keys) if args.stage == "content" else set()
+        pending = [row for row in rows if args.stage == "metadata" and row.get("unique_key") not in known]
+        updates = [row for row in rows if args.stage == "content" and row.get("unique_key") in requested_keys and row.get("unique_key") in known]
+        created, updated, errors = 0, 0, []
+        created_keys = []
         for row in pending:
             payload = {
                 "parent": {"type": "data_source_id", "data_source_id": data_source_id},
-                "properties": build_properties(row, schema),
+                "properties": build_properties(row, schema, include_content=False),
                 "children": [
                     {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": f"机构：{row.get('agency', '')}"}}]}},
                     {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": row.get("title", "")}}]}},
@@ -188,6 +213,14 @@ def main():
             try:
                 request(token, "POST", "/pages", payload)
                 created += 1
+                created_keys.append(row["unique_key"])
+            except RuntimeError as exc:
+                errors.append({"unique_key": row.get("unique_key"), "title": row.get("title"), "error": str(exc)})
+            time.sleep(0.38)
+        for row in updates:
+            try:
+                request(token, "PATCH", f"/pages/{known[row['unique_key']]['page_id']}", {"properties": build_properties(row, schema, include_content=True)})
+                updated += 1
             except RuntimeError as exc:
                 errors.append({"unique_key": row.get("unique_key"), "title": row.get("title"), "error": str(exc)})
             time.sleep(0.38)
@@ -199,10 +232,14 @@ def main():
             "total_local": len(rows),
             "existing": len(known),
             "created": created,
-            "skipped": len(rows) - len(pending),
+            "updated": updated,
+            "stage": args.stage,
+            "skipped": len(rows) - len(pending) - len(updates),
             "errors": errors,
         }
         meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        if args.stage == "metadata":
+            Path(args.keys).write_text(json.dumps({"keys": created_keys}, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps(meta, ensure_ascii=False, indent=2))
         return 0 if not errors else 1
     except Exception as exc:

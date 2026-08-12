@@ -3,10 +3,11 @@ name: Federal News Scheduled Sync
 on:
   workflow_dispatch:
   schedule:
-    # Asia/Taipei 12:20, 00:20, 06:20 (GitHub cron uses UTC).
-    - cron: "20 4 * * *"
-    - cron: "20 16 * * *"
-    - cron: "20 22 * * *"
+    # Asia/Taipei 06:00, 11:50, 12:00, 18:00 (GitHub cron uses UTC).
+    - cron: "0 22 * * *"
+    - cron: "50 3 * * *"
+    - cron: "0 4 * * *"
+    - cron: "0 10 * * *"
 
 concurrency:
   group: federal-news-sync
@@ -18,7 +19,7 @@ permissions:
 jobs:
   scrape-translate-sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     env:
       PYTHONUTF8: "1"
       NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
@@ -44,11 +45,17 @@ jobs:
           test -n "$NOTION_API_KEY" || { echo "Missing NOTION_API_KEY"; exit 1; }
           test -n "$NOTION_DATABASE_ID" || { echo "Missing NOTION_DATABASE_ID"; exit 1; }
 
-      - name: Scrape and translate latest five days
+      - name: Scrape listings and translate titles
         run: python scraper.py --translate
 
-      - name: Sync new records to Notion
-        run: python notion_sync.py
+      - name: Write new metadata to Notion
+        run: python notion_sync.py --stage metadata
+
+      - name: Fetch and translate content for newly created records only
+        run: python scraper.py --content-keys data/notion-new-keys.json
+
+      - name: Update content for newly created records
+        run: python notion_sync.py --stage content --keys data/notion-new-keys.json
 
       - name: Upload run data and diagnostics
         if: always()
