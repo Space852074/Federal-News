@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 API = "https://api.notion.com/v1"
 NOTION_VERSION = "2026-03-11"
-DEFAULT_DATABASE_ID = "3a393e41daef80ea84bcfc4d06501ec3"
+DEFAULT_DATABASE_ID = "3b893e41daef805e8d84e4ea188657ac"
 CA_FILE = ROOT / "vendor" / "certifi" / "cacert.pem"
 
 

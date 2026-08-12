@@ -26,5 +26,5 @@ async function pollNotion(){
   if(s.status==='partial'){$('#notice').textContent=`Notion 部分完成：新增 ${s.created} 条，失败 ${(s.errors||[]).length} 条`;return}
   $('#notice').textContent=s.error||`Notion 状态：${s.status}`;
 }
-$('#notion').onclick=async()=>{const token=prompt('粘贴 Notion 内部集成令牌（仅在本机内存中使用，不会保存）');if(!token)return;const r=await fetch('/api/notion-sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:token.trim(),database_id:'3a393e41daef80ea84bcfc4d06501ec3'})});const started=await r.json();if(!r.ok){$('#notice').textContent=started.error||'无法启动 Notion 同步';return}$('#notice').textContent='正在同步 Notion…';setTimeout(pollNotion,1500)};
+$('#notion').onclick=async()=>{const token=prompt('粘贴 Notion 内部集成令牌（仅在本机内存中使用，不会保存）');if(!token)return;const r=await fetch('/api/notion-sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:token.trim(),database_id:'3b893e41daef805e8d84e4ea188657ac'})});const started=await r.json();if(!r.ok){$('#notice').textContent=started.error||'无法启动 Notion 同步';return}$('#notice').textContent='正在同步 Notion…';setTimeout(pollNotion,1500)};
 load();

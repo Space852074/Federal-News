@@ -43,7 +43,7 @@ python scraper.py --translate
 
 ```powershell
 $env:NOTION_API_KEY='ntn_你的令牌'
-$env:NOTION_DATABASE_ID='3a393e41daef80ea84bcfc4d06501ec3'
+$env:NOTION_DATABASE_ID='3b893e41daef805e8d84e4ea188657ac'
 python notion_sync.py
 ```
 
