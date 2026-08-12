@@ -106,18 +106,24 @@ def state_value(config: dict, desired: str):
 
 def build_properties(row: dict, schema: dict):
     title_name, _ = title_property(schema)
-    props = {title_name: title_value(row.get("title_zh") or row.get("title") or "无标题")}
+    # 该数据库以“部门”为标题列，新闻标题存放在 rich_text“标题”列。
+    title_text_name, _ = find_property(schema, "标题", "rich_text")
+    primary_value = row.get("agency") if title_text_name else (row.get("title_zh") or row.get("title") or "无标题")
+    props = {title_name: title_value(primary_value or "未知机构")}
 
     date_name, _ = find_property(schema, "SortDate", "date")
+    date_name = date_name or find_property(schema, "日期", "date")[0]
     if date_name and row.get("date"):
         props[date_name] = {"date": {"start": row["date"]}}
 
     txt_name, _ = find_property(schema, "txt", "rich_text")
+    txt_name = txt_name or title_text_name
     if txt_name:
-        value = row.get("summary_zh") or row.get("summary") or row.get("title_zh") or row.get("title", "")
+        value = row.get("title_zh") or row.get("title") or row.get("summary_zh") or row.get("summary", "")
         props[txt_name] = text_value(value)
 
     link_name, _ = find_property(schema, "link", "url")
+    link_name = link_name or find_property(schema, "网址", "url")[0]
     if link_name:
         props[link_name] = {"url": row.get("url") or None}
 
@@ -160,7 +166,12 @@ def main():
         schema = data_source.get("properties", {})
         key_name, _ = find_property(schema, "UniqueKey", "rich_text")
         if not key_name:
-            raise RuntimeError("目标数据库缺少 rich_text 类型的 UniqueKey 字段")
+            request(token, "PATCH", f"/data_sources/{data_source_id}", {"properties": {"UniqueKey": {"rich_text": {}}}})
+            data_source = request(token, "GET", f"/data_sources/{data_source_id}")
+            schema = data_source.get("properties", {})
+            key_name, _ = find_property(schema, "UniqueKey", "rich_text")
+        if not key_name:
+            raise RuntimeError("无法在目标数据库创建 UniqueKey 去重字段")
         known = existing_keys(token, data_source_id, key_name)
         rows = json.loads((DATA / "news.json").read_text(encoding="utf-8"))
         pending = [row for row in rows if row.get("unique_key") not in known]
