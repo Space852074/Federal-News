@@ -8,6 +8,8 @@ on:
     - cron: "50 3 * * *"
     - cron: "0 4 * * *"
     - cron: "0 10 * * *"
+    # Temporary automatic-trigger test: 2026-08-13 20:27 Asia/Taipei.
+    - cron: "27 12 * * *"
 
 concurrency:
   group: federal-news-sync
