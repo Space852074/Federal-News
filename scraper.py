@@ -599,20 +599,30 @@ def load_key_file(path):
 
 
 def process_new_content(key_file):
-    """Fetch and translate bodies only for pages created by this run's metadata sync."""
+    """Inspect new pages, but translate and return bodies only when monitored keywords match."""
     rows = json.loads((DATA / "news.json").read_text(encoding="utf-8"))
     target_keys = load_key_file(key_file)
     targets = [row for row in rows if row.get("unique_key") in target_keys]
     targets = enrich_contents(targets, [])
-    targets = translate_contents(targets)
     for row in targets:
         apply_keyword_markers(row)
+    matched = [row for row in targets if row.get("keyword_markers")]
+    matched_keys = {row["unique_key"] for row in matched}
+    # Avoid translating or syncing full text for ordinary news. The extracted
+    # English body is retained only long enough to perform keyword matching.
+    for row in targets:
+        if row["unique_key"] not in matched_keys:
+            row["content"] = ""
+            row["content_zh"] = ""
+    matched = translate_contents(matched)
+    Path(key_file).write_text(json.dumps({"keys": sorted(matched_keys)}, ensure_ascii=False, indent=2), encoding="utf-8")
     (DATA / "news.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
     result = {
         "requested": len(target_keys),
-        "processed": len(targets),
-        "content_extracted": sum(bool(row.get("content")) for row in targets),
-        "content_translated": sum(bool(row.get("content_zh")) for row in targets),
+        "inspected": len(targets),
+        "keyword_matched": len(matched),
+        "content_extracted": sum(bool(row.get("content")) for row in matched),
+        "content_translated": sum(bool(row.get("content_zh")) for row in matched),
     }
     (DATA / "content-stage.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(result, ensure_ascii=False, indent=2))
