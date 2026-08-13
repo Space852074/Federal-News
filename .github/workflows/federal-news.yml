@@ -8,8 +8,6 @@ on:
     - cron: "50 3 * * *"
     - cron: "0 4 * * *"
     - cron: "0 10 * * *"
-    # Temporary automatic-trigger test: 2026-08-13 14:32 Asia/Taipei.
-    - cron: "32 6 * * *"
 
 concurrency:
   group: federal-news-sync
@@ -67,5 +65,6 @@ jobs:
           path: data/*.json
           if-no-files-found: warn
           retention-days: 14
+
 
 
