@@ -239,7 +239,13 @@ def main():
         }
         meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         if args.stage == "metadata":
-            Path(args.keys).write_text(json.dumps({"keys": created_keys}, ensure_ascii=False, indent=2), encoding="utf-8")
+            retry_marked = [
+                row["unique_key"] for row in rows
+                if row.get("unique_key") in known
+                and not known[row["unique_key"]]["has_content"]
+                and (row.get("title_zh") or "").startswith(("🔴", "🟡"))
+            ]
+            Path(args.keys).write_text(json.dumps({"keys": sorted(set(created_keys + retry_marked))}, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps(meta, ensure_ascii=False, indent=2))
         return 0 if not errors else 1
     except Exception as exc:
