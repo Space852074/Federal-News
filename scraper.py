@@ -10,6 +10,7 @@ import os
 import re
 import ssl
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
@@ -45,6 +46,9 @@ NON_NEWS_TITLES = {
 }
 RED_KEYWORDS = re.compile(r"\b(?:china|chinese)\b", re.I)
 YELLOW_KEYWORDS = re.compile(r"\b(?:virus|covid-?19|vaccine|fentanyl)\b", re.I)
+DOJ_API = "https://www.justice.gov/api/v1/press_releases.json?sort=created&direction=DESC&pagesize=100&page={}"
+DOJ_BODY_CACHE = None
+DOJ_BODY_LOCK = threading.Lock()
 
 
 def apply_keyword_markers(row):
@@ -527,9 +531,47 @@ def extract_article_content(row):
             if any(x in normalized for x in ("subscribe", "privacy policy", "accessibility", "all rights reserved", "share this page")):
                 continue
             seen.add(normalized); paragraphs.append(paragraph)
-        return row["unique_key"], "\n\n".join(paragraphs)[:8000]
-    except Exception:
+        content = "\n\n".join(paragraphs)[:8000]
+        if content:
+            return row["unique_key"], content
+        if urlparse(url).netloc.lower().endswith("justice.gov"):
+            return row["unique_key"], extract_doj_api_content(row)
         return row["unique_key"], ""
+    except Exception:
+        if urlparse(url).netloc.lower().endswith("justice.gov"):
+            return row["unique_key"], extract_doj_api_content(row)
+        return row["unique_key"], ""
+
+
+def extract_doj_api_content(row):
+    """Use DOJ's official JSON API when Akamai serves an interstitial page."""
+    global DOJ_BODY_CACHE
+    with DOJ_BODY_LOCK:
+        if DOJ_BODY_CACHE is None:
+            DOJ_BODY_CACHE = {}
+            for page in range(8):
+                try:
+                    response = QUICK_SESSION.get(DOJ_API.format(page), timeout=35)
+                    response.raise_for_status()
+                    for item in response.json().get("results", []):
+                        body = item.get("body") or ""
+                        if not body:
+                            continue
+                        parser = ArticleTextParser()
+                        parser.feed("<article>" + body + "</article>")
+                        content = "\n\n".join(dict.fromkeys(parser.paragraphs))[:8000]
+                        entry = {"title": clean_title(item.get("title", "")), "content": content}
+                        item_url = (item.get("url") or "").split("#")[0].rstrip("/")
+                        if item_url:
+                            DOJ_BODY_CACHE[item_url] = entry
+                except Exception:
+                    continue
+    normalized_url = (row.get("url") or "").split("#")[0].rstrip("/")
+    match = DOJ_BODY_CACHE.get(normalized_url)
+    if not match:
+        wanted = clean_title(row.get("title", "")).casefold()
+        match = next((item for item in DOJ_BODY_CACHE.values() if item["title"].casefold() == wanted), None)
+    return (match or {}).get("content", "")
 
 
 def enrich_contents(rows, old_rows):
