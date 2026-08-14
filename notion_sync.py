@@ -66,6 +66,11 @@ def title_property(schema: dict):
     raise RuntimeError("目标数据源没有 title 类型字段")
 
 
+def content_property(schema: dict):
+    """Support both the requested 内容 column and the database's current 文本 column."""
+    return find_property(schema, "内容", "rich_text")[0] or find_property(schema, "文本", "rich_text")[0]
+
+
 def text_value(value: str, max_chars=10000):
     value = (value or "")[:max_chars]
     return {"rich_text": [{"type": "text", "text": {"content": value[i:i+1900]}} for i in range(0, len(value), 1900)]}
@@ -150,7 +155,7 @@ def build_properties(row: dict, schema: dict, include_content=True):
         value = state_value(state_config, row.get("state", "已翻译"))
         if value:
             props[state_name] = value
-    content_name, _ = find_property(schema, "内容", "rich_text")
+    content_name = content_property(schema)
     if include_content and content_name and (row.get("content_zh") or row.get("content")):
         props[content_name] = text_value(row.get("content_zh") or row.get("content"), 10000)
     return props
@@ -193,7 +198,7 @@ def main():
             key_name, _ = find_property(schema, "UniqueKey", "rich_text")
         if not key_name:
             raise RuntimeError("无法在目标数据库创建 UniqueKey 去重字段")
-        content_name, _ = find_property(schema, "内容", "rich_text")
+        content_name = content_property(schema)
         known = existing_records(token, data_source_id, key_name, content_name)
         rows = json.loads((DATA / "news.json").read_text(encoding="utf-8"))
         requested_keys = load_keys(args.keys) if args.stage == "content" else set()
