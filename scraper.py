@@ -10,14 +10,15 @@ import os
 import re
 import ssl
 import sys
+import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus, urljoin, urlparse
-from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parent
@@ -45,15 +46,19 @@ NON_NEWS_TITLES = {
 }
 RED_KEYWORDS = re.compile(r"\b(?:china|chinese)\b", re.I)
 YELLOW_KEYWORDS = re.compile(r"\b(?:virus|covid-?19|vaccine|fentanyl)\b", re.I)
+DOJ_API = "https://www.justice.gov/api/v1/press_releases.json?sort=created&direction=DESC&pagesize=100&page={}"
+DOJ_BODY_CACHE = None
+DOJ_BODY_LOCK = threading.Lock()
+AZURE_TRANSLATOR_ENDPOINT = "https://api.cognitive.microsofttranslator.com"
 
 
 def apply_keyword_markers(row):
     """Prefix the display title when the English title or article body matches monitored terms."""
     haystack = "\n".join((row.get("title", ""), row.get("content", "")))
     markers = ("🔴" if RED_KEYWORDS.search(haystack) else "") + ("🟡" if YELLOW_KEYWORDS.search(haystack) else "")
-    title = (row.get("title_zh") or row.get("title") or "").lstrip("🔴🟡")
-    if title:
-        row["title_zh"] = markers + title
+    title_zh = (row.get("title_zh") or "").lstrip("🔴🟡")
+    if title_zh:
+        row["title_zh"] = markers + title_zh
     row["keyword_markers"] = markers
     return row
 
@@ -456,59 +461,97 @@ def scrape_source(source, cutoff):
     return [], status
 
 
-def translate_openai(rows):
-    token = os.environ.get("OPENAI_API_KEY")
-    pending = [row for row in rows if not row.get("title_zh")]
-    if not token or not pending:
-        return rows
-    endpoint = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/") + "/responses"
-    model = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
-    for start in range(0, len(pending), 20):
-        batch = pending[start:start+20]
-        prompt = "将以下美国政府新闻标题翻译成准确、简洁的简体中文。仅返回JSON数组，每项含key,title_zh。\n" + json.dumps([{"key":r["unique_key"],"title":r["title"]} for r in batch], ensure_ascii=False)
-        payload = json.dumps({"model": model, "input": prompt}).encode()
-        req = Request(endpoint, data=payload, method="POST", headers={"Authorization": f"Bearer {token}", "Content-Type":"application/json"})
+def valid_chinese_translation(source, translated):
+    """Reject cached English text that older runs incorrectly treated as Chinese."""
+    translated = (translated or "").lstrip("🔴🟡").strip()
+    return bool(
+        translated
+        and translated.casefold() != (source or "").strip().casefold()
+        and re.search(r"[\u3400-\u9fff]", translated)
+    )
+
+
+def azure_translate_texts(texts):
+    """Translate an ordered batch of English strings with Azure Translator F0."""
+    if not texts:
+        return []
+    key = os.environ.get("AZURE_TRANSLATOR_KEY", "").strip()
+    region = os.environ.get("AZURE_TRANSLATOR_REGION", "").strip()
+    endpoint = (os.environ.get("AZURE_TRANSLATOR_ENDPOINT") or AZURE_TRANSLATOR_ENDPOINT).strip().rstrip("/")
+    if not key:
+        raise RuntimeError("未设置 AZURE_TRANSLATOR_KEY，无法执行 Azure 翻译")
+    headers = {
+        "Ocp-Apim-Subscription-Key": key,
+        "Content-Type": "application/json",
+        "X-ClientTraceId": str(uuid.uuid4()),
+    }
+    if region:
+        headers["Ocp-Apim-Subscription-Region"] = region
+    last_error = None
+    for attempt in range(1, 4):
         try:
-            with urlopen(req, timeout=90) as res:
-                obj = json.loads(res.read())
-            text = "".join(x.get("text","") for item in obj.get("output",[]) for x in item.get("content",[]) if x.get("type")=="output_text")
-            data = json.loads(text[text.find("["):text.rfind("]")+1])
-            mapping = {x["key"]:x["title_zh"] for x in data}
-            for row in batch:
-                translated = mapping.get(row["unique_key"], "").strip()
-                if translated:
-                    row["title_zh"] = translated
-                    row["state"] = "已翻译"
-        except Exception:
-            continue
-    return rows
+            response = QUICK_SESSION.post(
+                endpoint + "/translate",
+                params={"api-version": "3.0", "from": "en", "to": "zh-Hans"},
+                headers=headers,
+                json=[{"text": text} for text in texts],
+                timeout=(10, 60),
+            )
+            if response.status_code == 429 or response.status_code >= 500:
+                retry_after = response.headers.get("Retry-After", "")
+                delay = float(retry_after) if retry_after.isdigit() else 2 ** attempt
+                last_error = f"HTTP {response.status_code}: {response.text[:300]}"
+                if attempt < 3:
+                    time.sleep(min(delay, 20))
+                    continue
+            response.raise_for_status()
+            payload = response.json()
+            if len(payload) != len(texts):
+                raise RuntimeError(f"Azure 返回 {len(payload)} 项，预期 {len(texts)} 项")
+            return [
+                ((item.get("translations") or [{}])[0].get("text") or "").strip()
+                for item in payload
+            ]
+        except (requests.RequestException, ValueError, RuntimeError) as exc:
+            last_error = str(exc)
+            if attempt < 3:
+                time.sleep(2 ** attempt)
+    raise RuntimeError(f"Azure Translator 调用失败：{last_error}")
 
 
-def translate_google(rows):
-    """无密钥翻译兜底；实现方式与 Congress Monitor 的 translator.py 一致。"""
+def translate_in_batches(texts, max_items=100, max_chars=45000):
+    """Respect Azure's per-request item and character limits while preserving order."""
+    translated, batch, size = [], [], 0
+    for text in texts:
+        if batch and (len(batch) >= max_items or size + len(text) > max_chars):
+            translated.extend(azure_translate_texts(batch))
+            batch, size = [], 0
+        batch.append(text)
+        size += len(text)
+    if batch:
+        translated.extend(azure_translate_texts(batch))
+    return translated
+
+
+def translate_azure(rows):
+    """Translate pending titles with Azure and leave invalid results pending."""
+    for row in rows:
+        if row.get("title_zh") and not valid_chinese_translation(row.get("title"), row.get("title_zh")):
+            row["title_zh"] = ""
+            row["state"] = "待翻译"
     pending = [row for row in rows if not row.get("title_zh")]
     if not pending:
         return rows
-
-    def translate_one(row):
-        try:
-            response = QUICK_SESSION.get(
-                "https://translate.googleapis.com/translate_a/single",
-                params={"client": "gtx", "sl": "auto", "tl": "zh-CN", "dt": "t", "q": row["title"]},
-                timeout=25,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            translated = "".join(part[0] for part in payload[0] if part and part[0]).strip()
-            return row["unique_key"], translated
-        except Exception:
-            return row["unique_key"], ""
-
-    by_key = {row["unique_key"]: row for row in pending}
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        for key, translated in pool.map(translate_one, pending):
-            if translated and translated.casefold() != by_key[key]["title"].strip().casefold():
-                by_key[key].update({"title_zh": translated, "state": "已翻译"})
+    results = translate_in_batches([row["title"] for row in pending])
+    invalid = []
+    for row, translated in zip(pending, results):
+        if valid_chinese_translation(row["title"], translated):
+            row.update({"title_zh": translated, "state": "已翻译"})
+        else:
+            invalid.append(row["title"])
+    if invalid:
+        examples = " | ".join(invalid[:3])
+        raise RuntimeError(f"Azure 未返回有效中文标题翻译（{len(invalid)} 条）：{examples}")
     return rows
 
 
@@ -527,9 +570,47 @@ def extract_article_content(row):
             if any(x in normalized for x in ("subscribe", "privacy policy", "accessibility", "all rights reserved", "share this page")):
                 continue
             seen.add(normalized); paragraphs.append(paragraph)
-        return row["unique_key"], "\n\n".join(paragraphs)[:8000]
-    except Exception:
+        content = "\n\n".join(paragraphs)[:8000]
+        if content:
+            return row["unique_key"], content
+        if urlparse(url).netloc.lower().endswith("justice.gov"):
+            return row["unique_key"], extract_doj_api_content(row)
         return row["unique_key"], ""
+    except Exception:
+        if urlparse(url).netloc.lower().endswith("justice.gov"):
+            return row["unique_key"], extract_doj_api_content(row)
+        return row["unique_key"], ""
+
+
+def extract_doj_api_content(row):
+    """Use DOJ's official JSON API when Akamai serves an interstitial page."""
+    global DOJ_BODY_CACHE
+    with DOJ_BODY_LOCK:
+        if DOJ_BODY_CACHE is None:
+            DOJ_BODY_CACHE = {}
+            for page in range(8):
+                try:
+                    response = QUICK_SESSION.get(DOJ_API.format(page), timeout=35)
+                    response.raise_for_status()
+                    for item in response.json().get("results", []):
+                        body = item.get("body") or ""
+                        if not body:
+                            continue
+                        parser = ArticleTextParser()
+                        parser.feed("<article>" + body + "</article>")
+                        content = "\n\n".join(dict.fromkeys(parser.paragraphs))[:8000]
+                        entry = {"title": clean_title(item.get("title", "")), "content": content}
+                        item_url = (item.get("url") or "").split("#")[0].rstrip("/")
+                        if item_url:
+                            DOJ_BODY_CACHE[item_url] = entry
+                except Exception:
+                    continue
+    normalized_url = (row.get("url") or "").split("#")[0].rstrip("/")
+    match = DOJ_BODY_CACHE.get(normalized_url)
+    if not match:
+        wanted = clean_title(row.get("title", "")).casefold()
+        match = next((item for item in DOJ_BODY_CACHE.values() if item["title"].casefold() == wanted), None)
+    return (match or {}).get("content", "")
 
 
 def enrich_contents(rows, old_rows):
@@ -563,25 +644,13 @@ def translate_contents(rows):
             for index, chunk in enumerate(chunks):
                 jobs.append((row["unique_key"], index, chunk))
 
-    def translate_job(job):
-        key, index, chunk = job
-        try:
-            response = QUICK_SESSION.get(
-                "https://translate.googleapis.com/translate_a/single",
-                params={"client": "gtx", "sl": "auto", "tl": "zh-CN", "dt": "t", "q": chunk}, timeout=35,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            translated = "".join(part[0] for part in payload[0] if part and part[0]).strip()
-            return key, index, translated
-        except Exception:
-            return key, index, ""
-
     translations = {}
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        for key, index, translated in pool.map(translate_job, jobs):
-            if translated:
-                translations.setdefault(key, {})[index] = translated
+    results = translate_in_batches([chunk for _, _, chunk in jobs])
+    for (key, index, _), translated in zip(jobs, results):
+        if translated and re.search(r"[\u3400-\u9fff]", translated):
+            translations.setdefault(key, {})[index] = translated
+        else:
+            raise RuntimeError(f"Azure 未返回有效中文正文翻译：{key} 第 {index + 1} 段")
     for row in rows:
         pieces = translations.get(row["unique_key"], {})
         if pieces:
@@ -599,20 +668,30 @@ def load_key_file(path):
 
 
 def process_new_content(key_file):
-    """Fetch and translate bodies only for pages created by this run's metadata sync."""
+    """Inspect new pages, but translate and return bodies only when monitored keywords match."""
     rows = json.loads((DATA / "news.json").read_text(encoding="utf-8"))
     target_keys = load_key_file(key_file)
     targets = [row for row in rows if row.get("unique_key") in target_keys]
     targets = enrich_contents(targets, [])
-    targets = translate_contents(targets)
     for row in targets:
         apply_keyword_markers(row)
+    matched = [row for row in targets if row.get("keyword_markers")]
+    matched_keys = {row["unique_key"] for row in matched}
+    # Avoid translating or syncing full text for ordinary news. The extracted
+    # English body is retained only long enough to perform keyword matching.
+    for row in targets:
+        if row["unique_key"] not in matched_keys:
+            row["content"] = ""
+            row["content_zh"] = ""
+    matched = translate_contents(matched)
+    Path(key_file).write_text(json.dumps({"keys": sorted(matched_keys)}, ensure_ascii=False, indent=2), encoding="utf-8")
     (DATA / "news.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
     result = {
         "requested": len(target_keys),
-        "processed": len(targets),
-        "content_extracted": sum(bool(row.get("content")) for row in targets),
-        "content_translated": sum(bool(row.get("content_zh")) for row in targets),
+        "inspected": len(targets),
+        "keyword_matched": len(matched),
+        "content_extracted": sum(bool(row.get("content")) for row in matched),
+        "content_translated": sum(bool(row.get("content_zh")) for row in matched),
     }
     (DATA / "content-stage.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -635,7 +714,7 @@ def main():
             pending = sum(not row.get("title_zh") for row in rows)
             progress_meta = {**running_meta, "phase": "translating", "translation_total": pending, "translated": 0}
             (DATA / "meta.json").write_text(json.dumps(progress_meta, ensure_ascii=False, indent=2), encoding="utf-8")
-            rows = translate_google(translate_openai(rows))
+            rows = translate_azure(rows)
             for row in rows:
                 row["state"] = "已翻译" if row.get("title_zh") else "待翻译"
                 if row.get("title_zh"):
@@ -691,11 +770,10 @@ def main():
         by_key = {r["unique_key"]: r for r in news}
         rows = sorted(by_key.values(), key=lambda r: (r["date"], r["agency"]), reverse=True)
         if args.translate:
-            rows = translate_openai(rows)
-            pending_before_google = sum(not r.get("title_zh") for r in rows)
-            progress_meta = {**running_meta, "phase": "translating", "translation_total": pending_before_google, "translated": 0}
+            pending_before_azure = sum(not r.get("title_zh") for r in rows)
+            progress_meta = {**running_meta, "phase": "translating", "translation_total": pending_before_azure, "translated": 0}
             (DATA / "meta.json").write_text(json.dumps(progress_meta, ensure_ascii=False, indent=2), encoding="utf-8")
-            rows = translate_google(rows)
+            rows = translate_azure(rows)
         for row in rows:
             apply_keyword_markers(row)
             row["state"] = "已翻译" if row.get("title_zh") else "待翻译"
