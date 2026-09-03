@@ -12,7 +12,6 @@ import ssl
 import sys
 import threading
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -49,7 +48,10 @@ YELLOW_KEYWORDS = re.compile(r"\b(?:virus|covid-?19|vaccine|fentanyl)\b", re.I)
 DOJ_API = "https://www.justice.gov/api/v1/press_releases.json?sort=created&direction=DESC&pagesize=100&page={}"
 DOJ_BODY_CACHE = None
 DOJ_BODY_LOCK = threading.Lock()
-AZURE_TRANSLATOR_ENDPOINT = "https://api.cognitive.microsofttranslator.com"
+GOOGLE_TRANSLATE_ENDPOINTS = (
+    "https://translate.googleapis.com/translate_a/single",
+    "https://translate.google.com/translate_a/single",
+)
 
 
 def apply_keyword_markers(row):
@@ -471,70 +473,49 @@ def valid_chinese_translation(source, translated):
     )
 
 
-def azure_translate_texts(texts):
-    """Translate an ordered batch of English strings with Azure Translator F0."""
-    if not texts:
-        return []
-    key = os.environ.get("AZURE_TRANSLATOR_KEY", "").strip()
-    region = os.environ.get("AZURE_TRANSLATOR_REGION", "").strip()
-    endpoint = (os.environ.get("AZURE_TRANSLATOR_ENDPOINT") or AZURE_TRANSLATOR_ENDPOINT).strip().rstrip("/")
-    if not key:
-        raise RuntimeError("未设置 AZURE_TRANSLATOR_KEY，无法执行 Azure 翻译")
-    headers = {
-        "Ocp-Apim-Subscription-Key": key,
-        "Content-Type": "application/json",
-        "X-ClientTraceId": str(uuid.uuid4()),
-    }
-    if region:
-        headers["Ocp-Apim-Subscription-Region"] = region
+def google_translate_text(text):
+    """Translate one string through Google's no-key web endpoint with throttling retries."""
+    endpoints = [
+        value.strip() for value in os.environ.get("GOOGLE_TRANSLATE_ENDPOINT", "").split(",")
+        if value.strip()
+    ] or list(GOOGLE_TRANSLATE_ENDPOINTS)
     last_error = None
-    for attempt in range(1, 4):
+    for attempt in range(4):
+        endpoint = endpoints[attempt % len(endpoints)]
         try:
-            response = QUICK_SESSION.post(
-                endpoint + "/translate",
-                params={"api-version": "3.0", "from": "en", "to": "zh-Hans"},
-                headers=headers,
-                json=[{"text": text} for text in texts],
-                timeout=(10, 60),
+            response = QUICK_SESSION.get(
+                endpoint,
+                params={"client": "gtx", "sl": "en", "tl": "zh-CN", "dt": "t", "q": text},
+                timeout=(10, 45),
             )
-            if response.status_code == 429 or response.status_code >= 500:
-                retry_after = response.headers.get("Retry-After", "")
-                delay = float(retry_after) if retry_after.isdigit() else 2 ** attempt
-                last_error = f"HTTP {response.status_code}: {response.text[:300]}"
-                if attempt < 3:
-                    time.sleep(min(delay, 20))
-                    continue
             response.raise_for_status()
             payload = response.json()
-            if len(payload) != len(texts):
-                raise RuntimeError(f"Azure 返回 {len(payload)} 项，预期 {len(texts)} 项")
-            return [
-                ((item.get("translations") or [{}])[0].get("text") or "").strip()
-                for item in payload
-            ]
-        except (requests.RequestException, ValueError, RuntimeError) as exc:
+            translated = "".join(
+                part[0] for part in (payload[0] or []) if part and part[0]
+            ).strip()
+            if translated:
+                return translated
+            last_error = "Google 返回空翻译"
+        except (requests.RequestException, ValueError, TypeError, IndexError) as exc:
             last_error = str(exc)
-            if attempt < 3:
-                time.sleep(2 ** attempt)
-    raise RuntimeError(f"Azure Translator 调用失败：{last_error}")
+        if attempt < 3:
+            time.sleep(min(2 ** (attempt + 1), 12))
+    raise RuntimeError(f"Google 免费翻译调用失败：{last_error}")
 
 
-def translate_in_batches(texts, max_items=100, max_chars=45000):
-    """Respect Azure's per-request item and character limits while preserving order."""
-    translated, batch, size = [], [], 0
-    for text in texts:
-        if batch and (len(batch) >= max_items or size + len(text) > max_chars):
-            translated.extend(azure_translate_texts(batch))
-            batch, size = [], 0
-        batch.append(text)
-        size += len(text)
-    if batch:
-        translated.extend(azure_translate_texts(batch))
-    return translated
+def translate_texts(texts):
+    """Translate sequentially to reduce 429 responses from the free endpoint."""
+    delay = max(0.0, float(os.environ.get("GOOGLE_TRANSLATE_DELAY_SECONDS", "0.35")))
+    results = []
+    for index, text in enumerate(texts):
+        results.append(google_translate_text(text))
+        if delay and index + 1 < len(texts):
+            time.sleep(delay)
+    return results
 
 
-def translate_azure(rows):
-    """Translate pending titles with Azure and leave invalid results pending."""
+def translate_google(rows):
+    """Translate pending titles with Google and leave invalid cached text pending."""
     for row in rows:
         if row.get("title_zh") and not valid_chinese_translation(row.get("title"), row.get("title_zh")):
             row["title_zh"] = ""
@@ -542,7 +523,7 @@ def translate_azure(rows):
     pending = [row for row in rows if not row.get("title_zh")]
     if not pending:
         return rows
-    results = translate_in_batches([row["title"] for row in pending])
+    results = translate_texts([row["title"] for row in pending])
     invalid = []
     for row, translated in zip(pending, results):
         if valid_chinese_translation(row["title"], translated):
@@ -551,7 +532,7 @@ def translate_azure(rows):
             invalid.append(row["title"])
     if invalid:
         examples = " | ".join(invalid[:3])
-        raise RuntimeError(f"Azure 未返回有效中文标题翻译（{len(invalid)} 条）：{examples}")
+        raise RuntimeError(f"Google 未返回有效中文标题翻译（{len(invalid)} 条）：{examples}")
     return rows
 
 
@@ -645,12 +626,12 @@ def translate_contents(rows):
                 jobs.append((row["unique_key"], index, chunk))
 
     translations = {}
-    results = translate_in_batches([chunk for _, _, chunk in jobs])
+    results = translate_texts([chunk for _, _, chunk in jobs])
     for (key, index, _), translated in zip(jobs, results):
         if translated and re.search(r"[\u3400-\u9fff]", translated):
             translations.setdefault(key, {})[index] = translated
         else:
-            raise RuntimeError(f"Azure 未返回有效中文正文翻译：{key} 第 {index + 1} 段")
+            raise RuntimeError(f"Google 未返回有效中文正文翻译：{key} 第 {index + 1} 段")
     for row in rows:
         pieces = translations.get(row["unique_key"], {})
         if pieces:
@@ -714,7 +695,7 @@ def main():
             pending = sum(not row.get("title_zh") for row in rows)
             progress_meta = {**running_meta, "phase": "translating", "translation_total": pending, "translated": 0}
             (DATA / "meta.json").write_text(json.dumps(progress_meta, ensure_ascii=False, indent=2), encoding="utf-8")
-            rows = translate_azure(rows)
+            rows = translate_google(rows)
             for row in rows:
                 row["state"] = "已翻译" if row.get("title_zh") else "待翻译"
                 if row.get("title_zh"):
@@ -770,10 +751,10 @@ def main():
         by_key = {r["unique_key"]: r for r in news}
         rows = sorted(by_key.values(), key=lambda r: (r["date"], r["agency"]), reverse=True)
         if args.translate:
-            pending_before_azure = sum(not r.get("title_zh") for r in rows)
-            progress_meta = {**running_meta, "phase": "translating", "translation_total": pending_before_azure, "translated": 0}
+            pending_before_google = sum(not r.get("title_zh") for r in rows)
+            progress_meta = {**running_meta, "phase": "translating", "translation_total": pending_before_google, "translated": 0}
             (DATA / "meta.json").write_text(json.dumps(progress_meta, ensure_ascii=False, indent=2), encoding="utf-8")
-            rows = translate_azure(rows)
+            rows = translate_google(rows)
         for row in rows:
             apply_keyword_markers(row)
             row["state"] = "已翻译" if row.get("title_zh") else "待翻译"

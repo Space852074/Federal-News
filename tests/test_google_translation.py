@@ -10,39 +10,32 @@ class FakeResponse:
     headers = {}
     text = "ok"
 
-    def __init__(self, payload):
-        self.payload = payload
+    def __init__(self, translated):
+        self.translated = translated
 
     def raise_for_status(self):
         return None
 
     def json(self):
-        return self.payload
+        return [[[self.translated, "source", None, None]]]
 
 
 class FakeSession:
     def __init__(self):
         self.calls = []
 
-    def post(self, url, **kwargs):
+    def get(self, url, **kwargs):
         self.calls.append((url, kwargs))
-        payload = [
-            {"translations": [{"text": "中译" + item["text"]}]}
-            for item in kwargs["json"]
-        ]
-        return FakeResponse(payload)
+        return FakeResponse("中译" + kwargs["params"]["q"])
 
 
-class AzureTranslationTests(unittest.TestCase):
+class GoogleTranslationTests(unittest.TestCase):
     def setUp(self):
         self.session = FakeSession()
         self.env = patch.dict(
             os.environ,
-            {
-                "AZURE_TRANSLATOR_KEY": "test-key",
-                "AZURE_TRANSLATOR_REGION": "eastasia",
-                "AZURE_TRANSLATOR_ENDPOINT": "",
-            },
+            {"GOOGLE_TRANSLATE_DELAY_SECONDS": "0"},
+            clear=False,
         )
         self.quick_session = patch.object(scraper, "QUICK_SESSION", self.session)
         self.env.start()
@@ -52,14 +45,12 @@ class AzureTranslationTests(unittest.TestCase):
         self.quick_session.stop()
         self.env.stop()
 
-    def test_uses_default_endpoint_and_region(self):
-        result = scraper.azure_translate_texts(["Alpha", "Beta"])
-        self.assertEqual(result, ["中译Alpha", "中译Beta"])
+    def test_uses_google_no_key_endpoint(self):
+        result = scraper.google_translate_text("Alpha")
+        self.assertEqual(result, "中译Alpha")
         url, kwargs = self.session.calls[0]
-        self.assertEqual(url, "https://api.cognitive.microsofttranslator.com/translate")
-        self.assertEqual(
-            kwargs["headers"]["Ocp-Apim-Subscription-Region"], "eastasia"
-        )
+        self.assertEqual(url, "https://translate.googleapis.com/translate_a/single")
+        self.assertEqual(kwargs["params"]["tl"], "zh-CN")
 
     def test_replaces_old_false_english_translation(self):
         rows = [
@@ -70,7 +61,7 @@ class AzureTranslationTests(unittest.TestCase):
                 "state": "已翻译",
             }
         ]
-        scraper.translate_azure(rows)
+        scraper.translate_google(rows)
         self.assertEqual(rows[0]["title_zh"], "中译China update")
         self.assertEqual(rows[0]["state"], "已翻译")
 
@@ -95,11 +86,6 @@ class AzureTranslationTests(unittest.TestCase):
             rows[0]["content_zh"],
             "中译First paragraph.\n\nSecond paragraph.",
         )
-
-    def test_missing_key_fails_clearly(self):
-        with patch.dict(os.environ, {"AZURE_TRANSLATOR_KEY": ""}):
-            with self.assertRaisesRegex(RuntimeError, "AZURE_TRANSLATOR_KEY"):
-                scraper.azure_translate_texts(["Title"])
 
 
 if __name__ == "__main__":

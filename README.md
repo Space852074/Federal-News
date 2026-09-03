@@ -46,14 +46,11 @@ GitHub 仓库需要配置以下 Actions Secrets：
 - `NOTION_API_KEY`
 - `NOTION_DATABASE_ID`
 - `NOTION_DATA_SOURCE_ID`（可选；数据库只有一个数据源时可不设置）
-- `AZURE_TRANSLATOR_KEY`（Azure Translator F0 的密钥）
-- `AZURE_TRANSLATOR_REGION`（区域或多服务资源必填，例如 `eastasia`；单服务
-  `global` 资源可不设置）
 
-翻译统一使用 Azure Translator。可选的仓库 Actions Variable
-`AZURE_TRANSLATOR_ENDPOINT` 可用于自定义端点；不设置时使用
-`https://api.cognitive.microsofttranslator.com`。如果 Azure 配置缺失或调用失败，
-任务会明确失败，不会把英文原文误写成“已翻译”。
+翻译使用无需密钥的 Google 免费网页接口，不需要额外 GitHub Secret。程序会串行
+请求、控制请求间隔并自动重试；若接口限流或返回无效结果，任务会明确失败，不会把
+英文原文误写成“已翻译”。可通过环境变量 `GOOGLE_TRANSLATE_DELAY_SECONDS`
+调整请求间隔，默认值为 `0.35` 秒。
 
 ## GitHub Actions 定时
 
