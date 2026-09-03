@@ -67,6 +67,27 @@ class GoogleTranslationTests(unittest.TestCase):
             result = scraper.google_translate_segment("Fallback title")
         self.assertEqual(result, "中译Fallback title")
 
+    def test_uses_apps_script_batch_when_configured(self):
+        class AppsScriptResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"ok": True, "translations": ["标题一", "标题二"]}
+
+        with patch.dict(
+            os.environ,
+            {
+                "GOOGLE_APPS_SCRIPT_URL": "https://script.google.com/example/exec",
+                "GOOGLE_APPS_SCRIPT_TOKEN": "test-token",
+            },
+        ), patch.object(
+            self.session, "post", return_value=AppsScriptResponse(), create=True
+        ) as post:
+            result = scraper.translate_texts(["Title one", "Title two"])
+        self.assertEqual(result, ["标题一", "标题二"])
+        self.assertEqual(post.call_args.kwargs["json"]["token"], "test-token")
+
     def test_replaces_old_false_english_translation(self):
         rows = [
             {

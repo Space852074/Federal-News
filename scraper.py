@@ -597,7 +597,40 @@ def google_translate_text(text):
     return "\n\n".join(translated_paragraphs)
 
 
+def translate_apps_script(texts):
+    """Translate a batch through the user's Google Apps Script LanguageApp proxy."""
+    url = os.environ.get("GOOGLE_APPS_SCRIPT_URL", "").strip()
+    token = os.environ.get("GOOGLE_APPS_SCRIPT_TOKEN", "").strip()
+    if not url:
+        return None
+    if not token:
+        raise RuntimeError("已设置 GOOGLE_APPS_SCRIPT_URL，但缺少 GOOGLE_APPS_SCRIPT_TOKEN")
+    try:
+        response = QUICK_SESSION.post(
+            url,
+            json={"token": token, "texts": texts, "source": "en", "target": "zh-CN"},
+            timeout=(15, 180),
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise RuntimeError(f"Google Apps Script 翻译请求失败：{exc}") from exc
+    if not payload.get("ok"):
+        raise RuntimeError(f"Google Apps Script 翻译失败：{payload.get('error', '未知错误')}")
+    translations = payload.get("translations") or []
+    if len(translations) != len(texts):
+        raise RuntimeError(f"Google Apps Script 返回 {len(translations)} 项，预期 {len(texts)} 项")
+    return [str(value).strip() for value in translations]
+
+
 def translate_texts(texts):
+    if not texts:
+        return []
+    if os.environ.get("GOOGLE_APPS_SCRIPT_URL", "").strip():
+        results = []
+        for start in range(0, len(texts), 50):
+            results.extend(translate_apps_script(texts[start:start + 50]))
+        return results
     return [google_translate_text(text) for text in texts]
 
 
