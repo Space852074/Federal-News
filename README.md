@@ -47,17 +47,20 @@ GitHub 仓库需要配置以下 Actions Secrets：
 - `NOTION_DATABASE_ID`
 - `NOTION_DATA_SOURCE_ID`（可选；数据库只有一个数据源时可不设置）
 
-GitHub Actions 通过 Google Apps Script 的 `LanguageApp.translate()` 免费翻译，避免
-Google 免费网页接口针对 GitHub 共享 IP 返回 429 或原文。部署代码位于
-`google_apps_script/Code.gs`。仓库还需配置两个 Actions Secrets：
+翻译流程与 Congress Monitor 保持一致：优先请求
+`clients5.google.com/translate_a/t`，失败后切换
+`translate.google.com/m`。文本按完整句子分段，单段最长 400 字符；每个分段
+最多尝试 3 轮，每轮依次尝试两个入口。成功结果保存到
+`logs/translation_cache.sqlite3`，后续运行优先查询缓存。
 
-- `GOOGLE_APPS_SCRIPT_URL`：Apps Script Web App 的 `/exec` 地址
-- `GOOGLE_APPS_SCRIPT_TOKEN`：与 Apps Script 项目属性 `FEDERAL_NEWS_TOKEN` 相同的随机值
+任何分段失败都会使整条记录进入一次二级重试。二次失败后不向
+Notion 写入英文或中英混合内容，也不标记为已处理，留待下次任务重新翻译。
+请求间隔和分段重试次数可由 `TRANSLATION_REQUEST_INTERVAL` 与
+`TRANSLATION_MAX_ATTEMPTS` 调整。
 
-本地未设置 Apps Script URL 时，程序仍复用 Congress Monitor 的备用策略：优先请求
-`clients5.google.com`，失败后切换 Google 移动版页面。长文本会被拆成不超过400字符
-的小段。请求间隔和重试次数可由 `GOOGLE_TRANSLATE_DELAY_SECONDS` 与
-`GOOGLE_TRANSLATE_MAX_ATTEMPTS` 调整。
+每次同步结束会分别输出 `Translation retries`、
+`Translation still failed after retry`、`Written`、`Skipped` 和
+`Write failed`，用来区分翻译失败与 Notion HTTP 写入失败。
 
 ## GitHub Actions 定时
 

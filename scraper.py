@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT / "vendor"))
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from translator import TranslationError, looks_untranslated, translate_text
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 GovernmentNewsAggregator/1.0"
 DATE_PATTERNS = [
@@ -51,6 +52,7 @@ DOJ_BODY_LOCK = threading.Lock()
 GOOGLE_TRANSLATE_MAX_SEGMENT = 400
 GOOGLE_TRANSLATE_LAST_REQUEST = 0.0
 GOOGLE_TRANSLATE_LOCK = threading.Lock()
+TRANSLATION_RETRY_DELAY = 1.0
 
 
 def apply_keyword_markers(row):
@@ -597,40 +599,9 @@ def google_translate_text(text):
     return "\n\n".join(translated_paragraphs)
 
 
-def translate_apps_script(texts):
-    """Translate a batch through the user's Google Apps Script LanguageApp proxy."""
-    url = os.environ.get("GOOGLE_APPS_SCRIPT_URL", "").strip()
-    token = os.environ.get("GOOGLE_APPS_SCRIPT_TOKEN", "").strip()
-    if not url:
-        return None
-    if not token:
-        raise RuntimeError("已设置 GOOGLE_APPS_SCRIPT_URL，但缺少 GOOGLE_APPS_SCRIPT_TOKEN")
-    try:
-        response = QUICK_SESSION.post(
-            url,
-            json={"token": token, "texts": texts, "source": "en", "target": "zh-CN"},
-            timeout=(15, 180),
-        )
-        response.raise_for_status()
-        payload = response.json()
-    except (requests.RequestException, ValueError) as exc:
-        raise RuntimeError(f"Google Apps Script 翻译请求失败：{exc}") from exc
-    if not payload.get("ok"):
-        raise RuntimeError(f"Google Apps Script 翻译失败：{payload.get('error', '未知错误')}")
-    translations = payload.get("translations") or []
-    if len(translations) != len(texts):
-        raise RuntimeError(f"Google Apps Script 返回 {len(translations)} 项，预期 {len(texts)} 项")
-    return [str(value).strip() for value in translations]
-
-
 def translate_texts(texts):
     if not texts:
         return []
-    if os.environ.get("GOOGLE_APPS_SCRIPT_URL", "").strip():
-        results = []
-        for start in range(0, len(texts), 50):
-            results.extend(translate_apps_script(texts[start:start + 50]))
-        return results
     return [google_translate_text(text) for text in texts]
 
 
@@ -654,6 +625,44 @@ def translate_google(rows):
         examples = " | ".join(invalid[:3])
         raise RuntimeError(f"Google 未返回有效中文标题翻译（{len(invalid)} 条）：{examples}")
     return rows
+
+
+def translate_records(rows):
+    """Translate titles and retry each failed record once before giving up."""
+    for row in rows:
+        cached = (row.get("title_zh") or "").lstrip("🔴🟡").strip()
+        if cached and looks_untranslated(row.get("title", ""), cached):
+            row.update({"title_zh": "", "state": "待翻译"})
+
+    pending = [row for row in rows if not row.get("title_zh")]
+
+    def attempt(row):
+        try:
+            translated = translate_text(row.get("title", ""))
+            if looks_untranslated(row.get("title", ""), translated):
+                raise TranslationError("translation was empty or unchanged")
+            row.update({"title_zh": translated.strip(), "state": "已翻译"})
+            row.pop("translation_error", None)
+            return True
+        except TranslationError as exc:
+            row.update({"title_zh": "", "state": "待翻译", "translation_error": str(exc)})
+            return False
+
+    failed = [row for row in pending if not attempt(row)]
+    retry_count = len(failed)
+    still_failed = []
+    for row in failed:
+        time.sleep(TRANSLATION_RETRY_DELAY)
+        if not attempt(row):
+            still_failed.append(row)
+
+    stats = {
+        "translation_retries": retry_count,
+        "translation_failed_after_retry": len(still_failed),
+    }
+    print(f"Translation retries: {stats['translation_retries']}")
+    print(f"Translation still failed after retry: {stats['translation_failed_after_retry']}")
+    return rows, stats
 
 
 def extract_article_content(row):
@@ -759,6 +768,39 @@ def translate_contents(rows):
     return rows
 
 
+def translate_content_records(rows):
+    """Translate complete article bodies; a partial or failed body is never accepted."""
+    pending = [row for row in rows if row.get("content") and not row.get("content_zh")]
+
+    def attempt(row):
+        try:
+            translated = translate_text(row["content"])
+            if looks_untranslated(row["content"], translated):
+                raise TranslationError("article translation was empty or unchanged")
+            row["content_zh"] = translated[:10000]
+            row.pop("content_translation_error", None)
+            return True
+        except TranslationError as exc:
+            row["content_zh"] = ""
+            row["content_translation_error"] = str(exc)
+            return False
+
+    failed = [row for row in pending if not attempt(row)]
+    retry_count = len(failed)
+    still_failed = []
+    for row in failed:
+        time.sleep(TRANSLATION_RETRY_DELAY)
+        if not attempt(row):
+            still_failed.append(row)
+    stats = {
+        "translation_retries": retry_count,
+        "translation_failed_after_retry": len(still_failed),
+    }
+    print(f"Translation retries: {stats['translation_retries']}")
+    print(f"Translation still failed after retry: {stats['translation_failed_after_retry']}")
+    return rows, stats
+
+
 def load_key_file(path):
     if not path:
         return set()
@@ -784,7 +826,7 @@ def process_new_content(key_file):
         if row["unique_key"] not in matched_keys:
             row["content"] = ""
             row["content_zh"] = ""
-    matched = translate_contents(matched)
+    matched, translation_stats = translate_content_records(matched)
     Path(key_file).write_text(json.dumps({"keys": sorted(matched_keys)}, ensure_ascii=False, indent=2), encoding="utf-8")
     (DATA / "news.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
     result = {
@@ -793,6 +835,7 @@ def process_new_content(key_file):
         "keyword_matched": len(matched),
         "content_extracted": sum(bool(row.get("content")) for row in matched),
         "content_translated": sum(bool(row.get("content_zh")) for row in matched),
+        **translation_stats,
     }
     (DATA / "content-stage.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -815,14 +858,14 @@ def main():
             pending = sum(not row.get("title_zh") for row in rows)
             progress_meta = {**running_meta, "phase": "translating", "translation_total": pending, "translated": 0}
             (DATA / "meta.json").write_text(json.dumps(progress_meta, ensure_ascii=False, indent=2), encoding="utf-8")
-            rows = translate_google(rows)
+            rows, translation_stats = translate_records(rows)
             for row in rows:
                 row["state"] = "已翻译" if row.get("title_zh") else "待翻译"
                 if row.get("title_zh"):
                     title_translations[row["title"]] = row["title_zh"]
             (DATA / "news.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
             (DATA / "translations.json").write_text(json.dumps(title_translations, ensure_ascii=False, indent=2), encoding="utf-8")
-            meta = {**previous_meta, "status": "complete", "refreshed_at": datetime.now(timezone.utc).isoformat(), "translated": sum(bool(r.get("title_zh")) for r in rows), "pending_translation": sum(not r.get("title_zh") for r in rows)}
+            meta = {**previous_meta, **translation_stats, "status": "complete", "refreshed_at": datetime.now(timezone.utc).isoformat(), "translated": sum(bool(r.get("title_zh")) for r in rows), "pending_translation": sum(not r.get("title_zh") for r in rows)}
             (DATA / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
             return
         sources = json.loads((ROOT / "sources.json").read_text(encoding="utf-8"))
@@ -870,11 +913,12 @@ def main():
                 row.update({"title_zh": title_zh, "summary_zh": summary_zh, "state": "已翻译"})
         by_key = {r["unique_key"]: r for r in news}
         rows = sorted(by_key.values(), key=lambda r: (r["date"], r["agency"]), reverse=True)
+        translation_stats = {"translation_retries": 0, "translation_failed_after_retry": 0}
         if args.translate:
             pending_before_google = sum(not r.get("title_zh") for r in rows)
             progress_meta = {**running_meta, "phase": "translating", "translation_total": pending_before_google, "translated": 0}
             (DATA / "meta.json").write_text(json.dumps(progress_meta, ensure_ascii=False, indent=2), encoding="utf-8")
-            rows = translate_google(rows)
+            rows, translation_stats = translate_records(rows)
         for row in rows:
             apply_keyword_markers(row)
             row["state"] = "已翻译" if row.get("title_zh") else "待翻译"
@@ -885,7 +929,7 @@ def main():
         (DATA / "translations.json").write_text(json.dumps(title_translations, ensure_ascii=False, indent=2), encoding="utf-8")
         (DATA / "news.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
         (DATA / "source_status.json").write_text(json.dumps(sorted(statuses, key=lambda x:x["agency"]), ensure_ascii=False, indent=2), encoding="utf-8")
-        meta = {"status":"complete", "refreshed_at":datetime.now(timezone.utc).isoformat(), "cutoff":cutoff.isoformat(), "items":len(rows), "sources":len(enabled), "ok":sum(s["health"]=="ok" for s in statuses), "empty":sum(s["health"]=="empty" for s in statuses), "error":sum(s["health"]=="error" for s in statuses), "translated":sum(bool(r.get("title_zh")) for r in rows), "pending_translation":sum(not r.get("title_zh") for r in rows), "content_extracted":sum(bool(r.get("content")) for r in rows), "content_translated":sum(bool(r.get("content_zh")) for r in rows)}
+        meta = {"status":"complete", "refreshed_at":datetime.now(timezone.utc).isoformat(), "cutoff":cutoff.isoformat(), "items":len(rows), "sources":len(enabled), "ok":sum(s["health"]=="ok" for s in statuses), "empty":sum(s["health"]=="empty" for s in statuses), "error":sum(s["health"]=="error" for s in statuses), "translated":sum(bool(r.get("title_zh")) for r in rows), "pending_translation":sum(not r.get("title_zh") for r in rows), "content_extracted":sum(bool(r.get("content")) for r in rows), "content_translated":sum(bool(r.get("content_zh")) for r in rows), **translation_stats}
         (DATA / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as exc:
         failed_meta = {"status": "error", "refreshed_at": datetime.now(timezone.utc).isoformat(), "error_message": str(exc)}

@@ -1,127 +1,86 @@
-import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import scraper
+import translator
+from translator import TranslationError
 
 
-class FakeResponse:
-    status_code = 200
-    headers = {}
-
-    def __init__(self, translated, mobile=False):
-        self.translated = translated
-        self.text = f'<div class="result-container">{translated}</div>' if mobile else "ok"
-
-    def raise_for_status(self):
-        return None
-
-    def json(self):
-        return [self.translated]
-
-
-class FakeSession:
-    def __init__(self):
-        self.calls = []
-
-    def get(self, url, **kwargs):
-        self.calls.append((url, kwargs))
-        return FakeResponse(
-            "中译" + kwargs["params"]["q"],
-            mobile=url.endswith("/m"),
+class TranslationTests(unittest.TestCase):
+    def test_sentence_split_preserves_abbreviation(self):
+        segments = translator.split_for_translation(
+            "The U.S. announced a policy. Another sentence follows."
         )
+        self.assertNotIn("The U.", segments)
+        self.assertNotIn("S.", segments)
+        self.assertEqual("".join(segments[:2]), "The U.S.announced a policy.")
 
-
-class GoogleTranslationTests(unittest.TestCase):
-    def setUp(self):
-        self.session = FakeSession()
-        self.env = patch.dict(
-            os.environ,
-            {"GOOGLE_TRANSLATE_DELAY_SECONDS": "0"},
-            clear=False,
-        )
-        self.quick_session = patch.object(scraper, "QUICK_SESSION", self.session)
-        self.env.start()
-        self.quick_session.start()
-
-    def tearDown(self):
-        self.quick_session.stop()
-        self.env.stop()
-
-    def test_uses_google_no_key_endpoint(self):
-        result = scraper.google_translate_text("Alpha")
-        self.assertEqual(result, "中译Alpha")
-        url, kwargs = self.session.calls[0]
-        self.assertEqual(url, "https://clients5.google.com/translate_a/t")
-        self.assertEqual(kwargs["params"]["tl"], "zh-CN")
-
-    def test_splits_long_text_for_google_limits(self):
-        segments = scraper.split_translation_text("Word " * 200)
+    def test_long_text_is_split_to_400_characters(self):
+        segments = translator.split_for_translation("Word " * 200)
         self.assertGreater(len(segments), 1)
         self.assertTrue(all(len(segment) <= 400 for segment in segments))
 
-    def test_parses_mobile_fallback_page(self):
-        with patch.object(
-            scraper, "translate_google_clients5", side_effect=RuntimeError("429")
-        ):
-            result = scraper.google_translate_segment("Fallback title")
-        self.assertEqual(result, "中译Fallback title")
-
-    def test_uses_apps_script_batch_when_configured(self):
-        class AppsScriptResponse:
-            def raise_for_status(self):
-                return None
-
-            def json(self):
-                return {"ok": True, "translations": ["标题一", "标题二"]}
-
-        with patch.dict(
-            os.environ,
-            {
-                "GOOGLE_APPS_SCRIPT_URL": "https://script.google.com/example/exec",
-                "GOOGLE_APPS_SCRIPT_TOKEN": "test-token",
-            },
-        ), patch.object(
-            self.session, "post", return_value=AppsScriptResponse(), create=True
-        ) as post:
-            result = scraper.translate_texts(["Title one", "Title two"])
-        self.assertEqual(result, ["标题一", "标题二"])
-        self.assertEqual(post.call_args.kwargs["json"]["token"], "test-token")
-
-    def test_replaces_old_false_english_translation(self):
-        rows = [
-            {
-                "unique_key": "1",
-                "title": "China update",
-                "title_zh": "China update",
-                "state": "已翻译",
-            }
-        ]
-        scraper.translate_google(rows)
-        self.assertEqual(rows[0]["title_zh"], "中译China update")
-        self.assertEqual(rows[0]["state"], "已翻译")
-
-    def test_marker_does_not_turn_english_into_chinese(self):
-        row = {"title": "China update", "title_zh": "", "content": ""}
-        scraper.apply_keyword_markers(row)
-        self.assertEqual(row["title_zh"], "")
-        self.assertEqual(row["keyword_markers"], "🔴")
-
-    def test_translates_keyword_content_in_order(self):
-        rows = [
-            {
-                "unique_key": "2",
-                "title": "Vaccine report",
-                "title_zh": "疫苗报告",
-                "content": "First paragraph.\n\nSecond paragraph.",
-                "content_zh": "",
-            }
-        ]
-        scraper.translate_contents(rows)
-        self.assertEqual(
-            rows[0]["content_zh"],
-            "中译First paragraph.\n\n中译Second paragraph.",
+    def test_short_abbreviations_are_not_false_failures(self):
+        self.assertFalse(translator.looks_untranslated("U.S.", "U.S."))
+        self.assertFalse(translator.looks_untranslated("H.R. 123", "H.R. 123"))
+        self.assertTrue(
+            translator.looks_untranslated(
+                "This complete sentence stayed English.",
+                "This complete sentence stayed English.",
+            )
         )
+
+    def test_clients5_failure_uses_mobile_fallback(self):
+        with patch.object(translator, "cache_get", return_value=""), patch.object(
+            translator, "cache_put"
+        ), patch.object(
+            translator, "translate_clients5", side_effect=RuntimeError("429")
+        ), patch.object(
+            translator, "translate_mobile", return_value="备用翻译"
+        ), patch.object(
+            translator, "throttle"
+        ):
+            self.assertEqual(translator.translate_one_segment("Fallback title", "zh-CN"), "备用翻译")
+
+    def test_sqlite_cache_round_trip(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+            translator, "CACHE_PATH", Path(folder) / "cache.sqlite3"
+        ):
+            translator.cache_put("Source", "zh-CN", "译文")
+            self.assertEqual(translator.cache_get("Source", "zh-CN"), "译文")
+
+    def test_title_record_is_retried_once(self):
+        rows = [{"unique_key": "1", "title": "China update", "title_zh": ""}]
+        with patch.object(
+            scraper,
+            "translate_text",
+            side_effect=[TranslationError("temporary"), "中国更新"],
+        ), patch.object(scraper.time, "sleep"):
+            result, stats = scraper.translate_records(rows)
+        self.assertEqual(result[0]["title_zh"], "中国更新")
+        self.assertEqual(stats["translation_retries"], 1)
+        self.assertEqual(stats["translation_failed_after_retry"], 0)
+
+    def test_second_title_failure_stays_pending(self):
+        rows = [{"unique_key": "2", "title": "A complete English title", "title_zh": ""}]
+        with patch.object(
+            scraper, "translate_text", side_effect=TranslationError("blocked")
+        ), patch.object(scraper.time, "sleep"):
+            result, stats = scraper.translate_records(rows)
+        self.assertEqual(result[0]["title_zh"], "")
+        self.assertEqual(result[0]["state"], "待翻译")
+        self.assertEqual(stats["translation_failed_after_retry"], 1)
+
+    def test_content_failure_never_keeps_english(self):
+        rows = [{"unique_key": "3", "content": "A complete English article body.", "content_zh": ""}]
+        with patch.object(
+            scraper, "translate_text", side_effect=TranslationError("blocked")
+        ), patch.object(scraper.time, "sleep"):
+            result, stats = scraper.translate_content_records(rows)
+        self.assertEqual(result[0]["content_zh"], "")
+        self.assertEqual(stats["translation_failed_after_retry"], 1)
 
 
 if __name__ == "__main__":

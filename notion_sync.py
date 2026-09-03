@@ -202,8 +202,30 @@ def main():
         known = existing_records(token, data_source_id, key_name, content_name)
         rows = json.loads((DATA / "news.json").read_text(encoding="utf-8"))
         requested_keys = load_keys(args.keys) if args.stage == "content" else set()
-        pending = [row for row in rows if args.stage == "metadata" and row.get("unique_key") not in known]
-        updates = [row for row in rows if args.stage == "content" and row.get("unique_key") in requested_keys and row.get("unique_key") in known]
+        metadata_candidates = [
+            row for row in rows
+            if row.get("title_zh") and row.get("state") == "已翻译"
+        ]
+        pending = [
+            row for row in metadata_candidates
+            if args.stage == "metadata" and row.get("unique_key") not in known
+        ]
+        updates = [
+            row for row in rows
+            if args.stage == "content"
+            and row.get("unique_key") in requested_keys
+            and row.get("unique_key") in known
+            and row.get("content_zh")
+        ]
+        translation_not_written = (
+            len(rows) - len(metadata_candidates) if args.stage == "metadata" else
+            sum(
+                row.get("unique_key") in requested_keys
+                and row.get("unique_key") in known
+                and not row.get("content_zh")
+                for row in rows
+            )
+        )
         created, updated, errors = 0, 0, []
         created_keys = []
         for row in pending:
@@ -240,6 +262,7 @@ def main():
             "updated": updated,
             "stage": args.stage,
             "skipped": len(rows) - len(pending) - len(updates),
+            "translation_not_written": translation_not_written,
             "errors": errors,
         }
         meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -251,6 +274,13 @@ def main():
                 and (row.get("title_zh") or "").startswith(("🔴", "🟡"))
             ]
             Path(args.keys).write_text(json.dumps({"keys": sorted(set(created_keys + retry_marked))}, ensure_ascii=False, indent=2), encoding="utf-8")
+        scrape_meta_path = DATA / ("content-stage.json" if args.stage == "content" else "meta.json")
+        scrape_meta = json.loads(scrape_meta_path.read_text(encoding="utf-8")) if scrape_meta_path.exists() else {}
+        print(f"Translation retries: {scrape_meta.get('translation_retries', 0)}")
+        print(f"Translation still failed after retry: {scrape_meta.get('translation_failed_after_retry', 0)}")
+        print(f"Written: {created + updated}")
+        print(f"Skipped: {meta['skipped']}")
+        print(f"Write failed: {len(errors)}")
         print(json.dumps(meta, ensure_ascii=False, indent=2))
         return 0 if not errors else 1
     except Exception as exc:

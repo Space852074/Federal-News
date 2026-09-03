@@ -7,3 +7,4 @@ vendor/
 .chrome-headless-test*/
 data/*
 data/notion-sync.lock
+logs/
