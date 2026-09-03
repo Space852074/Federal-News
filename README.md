@@ -47,10 +47,12 @@ GitHub 仓库需要配置以下 Actions Secrets：
 - `NOTION_DATABASE_ID`
 - `NOTION_DATA_SOURCE_ID`（可选；数据库只有一个数据源时可不设置）
 
-翻译使用无需密钥的 Google 免费网页接口，不需要额外 GitHub Secret。程序会串行
-请求、控制请求间隔并自动重试；若接口限流或返回无效结果，任务会明确失败，不会把
-英文原文误写成“已翻译”。可通过环境变量 `GOOGLE_TRANSLATE_DELAY_SECONDS`
-调整请求间隔，默认值为 `0.35` 秒。
+翻译使用无需密钥的 Google 免费网页接口，不需要额外 GitHub Secret。程序复用
+Congress Monitor 的翻译策略：优先请求 `clients5.google.com`，失败后切换 Google
+移动版页面，并将长文本拆分为不超过 400 字符的小段。程序会串行请求、控制请求间隔
+并自动重试；若两个通道都限流或返回无效结果，任务会明确失败，不会把英文原文误写
+成“已翻译”。请求间隔和重试次数可由 `GOOGLE_TRANSLATE_DELAY_SECONDS` 与
+`GOOGLE_TRANSLATE_MAX_ATTEMPTS` 调整。
 
 ## GitHub Actions 定时
 

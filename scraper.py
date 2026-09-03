@@ -48,10 +48,9 @@ YELLOW_KEYWORDS = re.compile(r"\b(?:virus|covid-?19|vaccine|fentanyl)\b", re.I)
 DOJ_API = "https://www.justice.gov/api/v1/press_releases.json?sort=created&direction=DESC&pagesize=100&page={}"
 DOJ_BODY_CACHE = None
 DOJ_BODY_LOCK = threading.Lock()
-GOOGLE_TRANSLATE_ENDPOINTS = (
-    "https://translate.googleapis.com/translate_a/single",
-    "https://translate.google.com/translate_a/single",
-)
+GOOGLE_TRANSLATE_MAX_SEGMENT = 400
+GOOGLE_TRANSLATE_LAST_REQUEST = 0.0
+GOOGLE_TRANSLATE_LOCK = threading.Lock()
 
 
 def apply_keyword_markers(row):
@@ -473,45 +472,133 @@ def valid_chinese_translation(source, translated):
     )
 
 
+class GoogleMobileResultParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.capture_depth = 0
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        classes = set((attrs.get("class") or "").split())
+        if self.capture_depth:
+            self.capture_depth += 1
+        elif tag == "div" and "result-container" in classes:
+            self.capture_depth = 1
+
+    def handle_endtag(self, _tag):
+        if self.capture_depth:
+            self.capture_depth -= 1
+
+    def handle_data(self, data):
+        if self.capture_depth and data.strip():
+            self.parts.append(data.strip())
+
+    @property
+    def translated(self):
+        return " ".join(self.parts).strip()
+
+
+def split_translation_text(text):
+    value = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not value:
+        return []
+    parts = [part.strip() for part in re.split(r"(?<=[.!?;。！？；])\s+|\n+", value) if part.strip()]
+    segments = []
+    for part in parts:
+        if len(part) <= GOOGLE_TRANSLATE_MAX_SEGMENT:
+            segments.append(part)
+            continue
+        current = ""
+        for word in part.split():
+            candidate = f"{current} {word}".strip()
+            if current and len(candidate) > GOOGLE_TRANSLATE_MAX_SEGMENT:
+                segments.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            segments.append(current)
+    return segments
+
+
+def throttle_google_translation():
+    global GOOGLE_TRANSLATE_LAST_REQUEST
+    delay = max(0.0, float(os.environ.get("GOOGLE_TRANSLATE_DELAY_SECONDS", "0.45")))
+    with GOOGLE_TRANSLATE_LOCK:
+        remaining = delay - (time.monotonic() - GOOGLE_TRANSLATE_LAST_REQUEST)
+        if remaining > 0:
+            time.sleep(remaining)
+        GOOGLE_TRANSLATE_LAST_REQUEST = time.monotonic()
+
+
+def translate_google_clients5(segment):
+    response = QUICK_SESSION.get(
+        "https://clients5.google.com/translate_a/t",
+        params={"client": "dict-chrome-ex", "sl": "auto", "tl": "zh-CN", "q": segment},
+        timeout=25,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if isinstance(payload, list):
+        translated = "".join(part for part in payload if isinstance(part, str)).strip()
+        if translated:
+            return translated
+    raise RuntimeError("clients5 返回格式异常")
+
+
+def translate_google_mobile(segment):
+    response = QUICK_SESSION.get(
+        "https://translate.google.com/m",
+        params={"sl": "auto", "tl": "zh-CN", "q": segment},
+        timeout=25,
+    )
+    response.raise_for_status()
+    parser = GoogleMobileResultParser()
+    parser.feed(response.text)
+    if parser.translated:
+        return parser.translated
+    raise RuntimeError("Google 移动版页面没有返回翻译结果")
+
+
+def google_translate_segment(segment):
+    attempts = max(1, int(os.environ.get("GOOGLE_TRANSLATE_MAX_ATTEMPTS", "3")))
+    errors = []
+    for attempt in range(attempts):
+        for provider in (translate_google_clients5, translate_google_mobile):
+            provider_name = getattr(provider, "__name__", provider.__class__.__name__)
+            throttle_google_translation()
+            try:
+                translated = provider(segment)
+                if translated and translated.casefold() != segment.casefold():
+                    return translated
+                errors.append(f"{provider_name}: 返回原文")
+            except Exception as exc:
+                errors.append(f"{provider_name}: {exc}")
+        if attempt + 1 < attempts:
+            time.sleep(min(8.0, 1.5 * (2 ** attempt)))
+    raise RuntimeError("; ".join(errors[-4:]))
+
+
 def google_translate_text(text):
-    """Translate one string through Google's no-key web endpoint with throttling retries."""
-    endpoints = [
-        value.strip() for value in os.environ.get("GOOGLE_TRANSLATE_ENDPOINT", "").split(",")
-        if value.strip()
-    ] or list(GOOGLE_TRANSLATE_ENDPOINTS)
-    last_error = None
-    for attempt in range(4):
-        endpoint = endpoints[attempt % len(endpoints)]
-        try:
-            response = QUICK_SESSION.get(
-                endpoint,
-                params={"client": "gtx", "sl": "en", "tl": "zh-CN", "dt": "t", "q": text},
-                timeout=(10, 45),
-            )
-            response.raise_for_status()
-            payload = response.json()
-            translated = "".join(
-                part[0] for part in (payload[0] or []) if part and part[0]
-            ).strip()
-            if translated:
-                return translated
-            last_error = "Google 返回空翻译"
-        except (requests.RequestException, ValueError, TypeError, IndexError) as exc:
-            last_error = str(exc)
-        if attempt < 3:
-            time.sleep(min(2 ** (attempt + 1), 12))
-    raise RuntimeError(f"Google 免费翻译调用失败：{last_error}")
+    """Use the same no-key Google clients5/mobile strategy as Congress Monitor."""
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text or "") if part.strip()]
+    if not paragraphs:
+        return text
+    translated_paragraphs = []
+    for paragraph in paragraphs:
+        translated_segments = []
+        for segment in split_translation_text(paragraph):
+            try:
+                translated_segments.append(google_translate_segment(segment))
+            except Exception as exc:
+                raise RuntimeError(f"Google 免费翻译调用失败：{exc}") from exc
+        translated_paragraphs.append("".join(translated_segments))
+    return "\n\n".join(translated_paragraphs)
 
 
 def translate_texts(texts):
-    """Translate sequentially to reduce 429 responses from the free endpoint."""
-    delay = max(0.0, float(os.environ.get("GOOGLE_TRANSLATE_DELAY_SECONDS", "0.35")))
-    results = []
-    for index, text in enumerate(texts):
-        results.append(google_translate_text(text))
-        if delay and index + 1 < len(texts):
-            time.sleep(delay)
-    return results
+    return [google_translate_text(text) for text in texts]
 
 
 def translate_google(rows):

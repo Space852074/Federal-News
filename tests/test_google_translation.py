@@ -8,16 +8,16 @@ import scraper
 class FakeResponse:
     status_code = 200
     headers = {}
-    text = "ok"
 
-    def __init__(self, translated):
+    def __init__(self, translated, mobile=False):
         self.translated = translated
+        self.text = f'<div class="result-container">{translated}</div>' if mobile else "ok"
 
     def raise_for_status(self):
         return None
 
     def json(self):
-        return [[[self.translated, "source", None, None]]]
+        return [self.translated]
 
 
 class FakeSession:
@@ -26,7 +26,10 @@ class FakeSession:
 
     def get(self, url, **kwargs):
         self.calls.append((url, kwargs))
-        return FakeResponse("中译" + kwargs["params"]["q"])
+        return FakeResponse(
+            "中译" + kwargs["params"]["q"],
+            mobile=url.endswith("/m"),
+        )
 
 
 class GoogleTranslationTests(unittest.TestCase):
@@ -49,8 +52,20 @@ class GoogleTranslationTests(unittest.TestCase):
         result = scraper.google_translate_text("Alpha")
         self.assertEqual(result, "中译Alpha")
         url, kwargs = self.session.calls[0]
-        self.assertEqual(url, "https://translate.googleapis.com/translate_a/single")
+        self.assertEqual(url, "https://clients5.google.com/translate_a/t")
         self.assertEqual(kwargs["params"]["tl"], "zh-CN")
+
+    def test_splits_long_text_for_google_limits(self):
+        segments = scraper.split_translation_text("Word " * 200)
+        self.assertGreater(len(segments), 1)
+        self.assertTrue(all(len(segment) <= 400 for segment in segments))
+
+    def test_parses_mobile_fallback_page(self):
+        with patch.object(
+            scraper, "translate_google_clients5", side_effect=RuntimeError("429")
+        ):
+            result = scraper.google_translate_segment("Fallback title")
+        self.assertEqual(result, "中译Fallback title")
 
     def test_replaces_old_false_english_translation(self):
         rows = [
@@ -84,7 +99,7 @@ class GoogleTranslationTests(unittest.TestCase):
         scraper.translate_contents(rows)
         self.assertEqual(
             rows[0]["content_zh"],
-            "中译First paragraph.\n\nSecond paragraph.",
+            "中译First paragraph.\n\n中译Second paragraph.",
         )
 
 
