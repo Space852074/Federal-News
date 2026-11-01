@@ -56,6 +56,23 @@ jobs:
       - name: Scrape listings and translate titles
         run: python scraper.py --translate
 
+      - name: Validate translated records
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          meta = json.loads(Path("data/meta.json").read_text(encoding="utf-8"))
+          items = int(meta.get("items", 0))
+          translated = int(meta.get("translated", 0))
+          if items > 0 and translated == 0:
+              raise SystemExit(
+                  f"All {items} title translations failed; refusing to report a successful Notion sync"
+              )
+          print(f"Translation validation passed: {translated}/{items} records translated")
+          PY
+
       - name: Write new metadata to Notion
         run: python notion_sync.py --stage metadata
 

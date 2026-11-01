@@ -9,6 +9,18 @@ from translator import TranslationError
 
 
 class TranslationTests(unittest.TestCase):
+    def test_clients5_parses_nested_translation_response(self):
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return [["国务卿召开新闻发布会", "en"]]
+
+        with patch.object(translator.SESSION, "get", return_value=Response()):
+            result = translator.translate_clients5("Secretary holds press availability", "zh-CN")
+        self.assertEqual(result, "国务卿召开新闻发布会")
+
     def test_sentence_split_preserves_abbreviation(self):
         segments = translator.split_for_translation(
             "The U.S. announced a policy. Another sentence follows."

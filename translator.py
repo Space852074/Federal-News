@@ -139,7 +139,24 @@ def translate_clients5(segment: str, target: str) -> str:
     response.raise_for_status()
     data = response.json()
     if isinstance(data, list):
-        translated = "".join(part for part in data if isinstance(part, str)).strip()
+        # The dict-chrome endpoint normally returns pairs such as
+        # [["translated text", "en"]].  Older code only accepted a flat
+        # list, so every valid GitHub response was incorrectly rejected and
+        # the workflow fell through to the rate-limited mobile endpoint.
+        translated_parts = []
+        for item in data:
+            if isinstance(item, str):
+                translated_parts.append(item)
+            elif isinstance(item, list) and item:
+                if isinstance(item[0], str):
+                    translated_parts.append(item[0])
+                elif isinstance(item[0], list):
+                    translated_parts.extend(
+                        part[0]
+                        for part in item
+                        if isinstance(part, list) and part and isinstance(part[0], str)
+                    )
+        translated = "".join(translated_parts).strip()
         if translated:
             return translated
     raise TranslationError("clients5 returned an unexpected response")
